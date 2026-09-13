@@ -13,15 +13,22 @@ COPY internal/ internal/
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
     go build -trimpath -ldflags='-s -w' -o /out/mongodb-backup-s3 ./cmd/mongodb-backup-s3
 
-FROM ubuntu:${UBUNTU_VERSION}
+FROM ubuntu:${UBUNTU_VERSION} AS tools
 ARG TARGETARCH
 ARG MONGODB_TOOLS_VERSION=100.18.0
 COPY src/install.sh /install.sh
 RUN TARGETARCH="${TARGETARCH}" MONGODB_TOOLS_VERSION="${MONGODB_TOOLS_VERSION}" \
     sh /install.sh && rm /install.sh
+COPY src/runtime-rootfs.sh /runtime-rootfs.sh
+RUN sh /runtime-rootfs.sh
+
+FROM scratch
+COPY --from=tools /runtime-rootfs/ /
 COPY --from=build /out/mongodb-backup-s3 /usr/local/bin/mongodb-backup-s3
 
-ENV BACKUP_MODE=full \
+ENV PATH=/usr/local/bin:/usr/bin:/bin \
+    HOME=/root \
+    BACKUP_MODE=full \
     MONGODB_URI="" \
     MONGODB_URI_FILE="" \
     MONGODB_DATABASE="" \

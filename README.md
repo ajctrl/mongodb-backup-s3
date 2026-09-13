@@ -17,8 +17,13 @@ MongoDB の `--oplog` は全体ダンプ専用です。
 
 ## ビルドと実行
 
-イメージは Ubuntu 24.04、Go 1.26、MongoDB Database Tools **100.18.0** を使用します。
+ビルドには Ubuntu 24.04、Go 1.26、MongoDB Database Tools **100.18.0** を使用します。
 Linux amd64 / arm64 に対応し、公式配布の `mongodump` と `mongorestore` を収録します。
+最終イメージは `scratch` をベースに、Ubuntu の実行用ライブラリ、GPG、`/bin/sh`、
+CA 証明書、タイムゾーンとライセンスを収録します。apt や一般的な管理コマンドは含みません。
+amd64 での展開後レイヤー合計は約 **89 MB**（従来の約164 MBから約46%削減）。
+Docker の `DISK USAGE` は圧縮データも含み、この環境では約127 MBです。
+サイズはビルド時のパッケージ更新やアーキテクチャによって変わります。
 Database Tools と MongoDB Server のバージョン体系は別です。結合テストは MongoDB 8.0 系を対象とします。
 運用中と同じ Server / FCV / Tools の組み合わせで復元を確認してください。
 [公式配布一覧](https://www.mongodb.com/try/download/database-tools/releases/archive)
