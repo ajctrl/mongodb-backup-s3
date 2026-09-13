@@ -1,0 +1,112 @@
+# Development only: isolated authenticated single-member replica set.
+# Configure S3 in .env, then: docker compose --env-file .env up -d --build
+services:
+  config-init:
+    image: busybox:1.37
+    user: "0:0"
+    volumes:
+      - mongodb-config:/bootstrap
+    command:
+      - sh
+      - -ec
+      - |
+        if [ ! -f /bootstrap/keyFile ]; then
+          head -c 512 /dev/urandom | base64 > /bootstrap/keyFile
+        fi
+        chmod 400 /bootstrap/keyFile
+        chown 999:999 /bootstrap/keyFile
+        printf '%s\n' \
+          'storage:' '  dbPath: /data/db' \
+          'net:' '  bindIpAll: true' '  port: 27017' \
+          'replication:' '  replSetName: rs0' \
+          'security:' '  authorization: enabled' '  keyFile: /bootstrap/keyFile' \
+          > /bootstrap/mongod.conf
+        chmod 444 /bootstrap/mongod.conf
+
+  mongodb:
+    image: mongo:8.0
+    depends_on:
+      config-init:
+        condition: service_completed_successfully
+    command: [mongod, --config, /bootstrap/mongod.conf]
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: development-root-password
+    volumes:
+      - mongodb-data:/data/db
+      - mongodb-config:/bootstrap:ro
+    healthcheck:
+      test:
+        - CMD
+        - mongosh
+        - --quiet
+        - mongodb://root:development-root-password@localhost:27017/?authSource=admin&directConnection=true
+        - --eval
+        - "quit(db.adminCommand({getCmdLineOpts: 1}).parsed.replication?.replSetName === 'rs0' ? 0 : 1)"
+      interval: 5s
+      timeout: 5s
+      retries: 60
+
+  replica-init:
+    image: mongo:8.0
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    entrypoint: [mongosh]
+    command:
+      - --quiet
+      - mongodb://root:development-root-password@mongodb:27017/?authSource=admin&directConnection=true
+      - --eval
+      - |
+        try { rs.status(); } catch (e) {
+          if (e.code !== 94) throw e;
+          const initiated = rs.initiate({_id: 'rs0', members: [{_id: 0, host: 'mongodb:27017'}]});
+          if (initiated.ok !== 1) throw new Error(JSON.stringify(initiated));
+        }
+        let primary = false;
+        for (let i = 0; i < 120; i++) {
+          if (db.hello().isWritablePrimary) { primary = true; break; }
+          sleep(500);
+        }
+        if (!primary) throw new Error('Replica set did not elect a primary');
+        const admin = db.getSiblingDB('admin');
+        if (!admin.getUser('backup')) {
+          admin.createUser({user: 'backup', pwd: 'development-backup-password',
+            roles: [{role: 'backup', db: 'admin'}, {role: 'clusterMonitor', db: 'admin'}]});
+        }
+        db.getSiblingDB('app').example.updateOne({_id: 'example'}, {$$setOnInsert: {message: 'development data'}}, {upsert: true});
+
+  backup:
+    build: .
+    depends_on:
+      replica-init:
+        condition: service_completed_successfully
+    environment:
+      MONGODB_URI: mongodb://backup:development-backup-password@mongodb:27017/?replicaSet=rs0&authSource=admin
+      MONGODB_READ_PREFERENCE: ${MONGODB_READ_PREFERENCE:-primary}
+      MONGODB_PARALLEL_COLLECTIONS: ${MONGODB_PARALLEL_COLLECTIONS:-4}
+      MONGODB_CONFIG_DIR: /backup-config
+      MONGODB_RESTORE_DROP: ${MONGODB_RESTORE_DROP:-false}
+      BACKUP_MODE: ${BACKUP_MODE:-full}
+      MONGODB_DATABASE: ${MONGODB_DATABASE:-}
+      MONGODB_DATABASES: ${MONGODB_DATABASES:-}
+      MONGODB_BACKUP_ALL: ${MONGODB_BACKUP_ALL:-false}
+      MONGODB_DATABASES_EXCLUDE: ${MONGODB_DATABASES_EXCLUDE:-}
+      SCHEDULE: ${SCHEDULE:-}
+      BACKUP_KEEP_DAYS: ${BACKUP_KEEP_DAYS:-}
+      BACKUP_FILENAME_MODE: ${BACKUP_FILENAME_MODE:-timestamp}
+      PASSPHRASE: ${PASSPHRASE:-}
+      S3_REGION: ${S3_REGION:-us-west-1}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
+      S3_SESSION_TOKEN: ${S3_SESSION_TOKEN:-}
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_PREFIX: ${S3_PREFIX-backup}
+      S3_ENDPOINT: ${S3_ENDPOINT:-}
+      S3_UPLOAD_PART_SIZE_MB: ${S3_UPLOAD_PART_SIZE_MB:-8}
+    volumes:
+      - mongodb-config:/backup-config:ro
+
+volumes:
+  mongodb-data:
+  mongodb-config:

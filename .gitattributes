@@ -1,0 +1,10 @@
+/src/*.sh text eol=lf
+/Dockerfile text eol=lf
+/docker-compose.yaml text eol=lf
+/template.env text eol=lf
+/go.mod text eol=lf
+/go.sum text eol=lf
+/cmd/** text eol=lf
+/internal/** text eol=lf
+/tests/** text eol=lf
+/.github/** text eol=lf

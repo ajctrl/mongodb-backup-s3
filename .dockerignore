@@ -1,0 +1,14 @@
+**
+!go.mod
+!go.sum
+!LICENSE
+!LICENSE.txt
+!cmd/
+!cmd/**
+!internal/
+!internal/**
+!src/
+!src/*.sh
+**/*_test.go
+.tools/
+mariadb-backup-s3-main/

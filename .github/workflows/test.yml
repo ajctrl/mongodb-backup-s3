@@ -1,0 +1,43 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Test with race detector
+        run: go test -count=1 -race ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Check formatting
+        shell: bash
+        run: test -z "$(gofmt -l cmd internal tests)"
+
+  integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build backup image
+        run: docker build -t mongodb-backup-s3:integration .
+      - name: MongoDB replica set and S3 round trips
+        env:
+          BACKUP_TEST_IMAGE: mongodb-backup-s3:integration
+          MONGODB_TEST_IMAGE: mongo:8.0
+        run: go test -count=1 -tags=integration -v -timeout=20m ./tests/integration
