@@ -34,17 +34,17 @@ import (
 )
 
 const (
-	defaultS3TestImage = "quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e"
+	defaultS3TestImage = "docker.io/pgsty/silo:RELEASE.2026-10-18T00-00-00Z-distroless@sha256:472f59c7be537571f0f9a2ee6b8fe033a220939d521255bd4bf5339e53db7218"
 	testPassword       = "integration-password"
 	testReplicaKey     = "aW50ZWdyYXRpb24tb25seS1yZXBsaWNhLWtleQ=="
 	testConfig         = "replication:\n  replSetName: source\nsecurity:\n  authorization: enabled\n"
 )
 
 // TestBackupRestore creates disposable authenticated source and destination
-// replica sets and a versioned MinIO bucket. By default it requires Docker and
+// replica sets and a versioned Silo bucket. By default it requires Docker and
 // an already-built mongodb-backup-s3:integration image. Set
-// MONGODB_NATIVE_INTEGRATION=1 to use local mongod, minio and backup binaries;
-// override paths with MONGOD_TEST_BINARY, MINIO_TEST_BINARY, BACKUP_TEST_BINARY.
+// MONGODB_NATIVE_INTEGRATION=1 to use local mongod, silo and backup binaries;
+// override paths with MONGOD_TEST_BINARY, SILO_TEST_BINARY, BACKUP_TEST_BINARY.
 // No existing database, container or bucket is modified by this suite.
 func TestBackupRestore(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Minute)
@@ -304,7 +304,7 @@ func newFixture(t *testing.T, ctx context.Context) *fixture {
 	if f.native {
 		f.binary = requireBinary(t, "BACKUP_TEST_BINARY", "mongodb-backup-s3")
 		mongod := requireBinary(t, "MONGOD_TEST_BINARY", "mongod")
-		minio := requireBinary(t, "MINIO_TEST_BINARY", "minio")
+		silo := requireBinary(t, "SILO_TEST_BINARY", "silo")
 		for _, server := range []struct{ port, set string }{{sourcePort, "source"}, {targetPort, "destination"}} {
 			dir := t.TempDir()
 			key := filepath.Join(dir, "keyFile")
@@ -318,7 +318,7 @@ func newFixture(t *testing.T, ctx context.Context) *fixture {
 			startProcess(t, mongod, nil, "--dbpath", dir, "--bind_ip", "127.0.0.1", "--port", server.port,
 				"--replSet", server.set, "--keyFile", key, "--oplogSize", "128")
 		}
-		startProcess(t, minio, []string{"MINIO_ROOT_USER=integration", "MINIO_ROOT_PASSWORD=" + testPassword},
+		startProcess(t, silo, []string{"MINIO_ROOT_USER=integration", "MINIO_ROOT_PASSWORD=" + testPassword},
 			"server", "--address", "127.0.0.1:"+s3Port, "--console-address", "127.0.0.1:"+unusedPort(t), t.TempDir())
 		f.outputPath = filepath.Join(f.outputDir, "extracted")
 	} else {
@@ -347,8 +347,10 @@ func newFixture(t *testing.T, ctx context.Context) *fixture {
 		// Finish the source first because the destination shares its namespace.
 		f.initializeReplica(t, sourcePort, "source")
 		startMongo(f.name+"-destination", targetPort, "destination", []string{"--network", "container:" + f.anchor})
+		// The distroless image's built-in probe cannot see the server's CLI port.
 		docker(t, ctx, "run", "-d", "--name", f.name+"-s3", "--network", "container:"+f.anchor,
 			"-e", "MINIO_ROOT_USER=integration", "-e", "MINIO_ROOT_PASSWORD="+testPassword,
+			"-e", "MINIO_HEALTHCHECK_URL="+f.endpoint,
 			envOr("S3_TEST_IMAGE", defaultS3TestImage), "server", "--address", ":"+s3Port, "/data")
 		f.outputPath = "/output/extracted"
 	}
@@ -366,7 +368,7 @@ func newFixture(t *testing.T, ctx context.Context) *fixture {
 		o.UsePathStyle = true
 		o.RetryMaxAttempts = 1
 	})
-	waitFor(t, ctx, "MinIO", func(ctx context.Context) error {
+	waitFor(t, ctx, "Silo", func(ctx context.Context) error {
 		_, err := f.s3.ListBuckets(ctx, &s3.ListBucketsInput{})
 		return err
 	})

@@ -378,6 +378,14 @@ docker build -t mongodb-backup-s3:integration .
 go test -count=1 -tags=integration -v -timeout=20m ./tests/integration
 ```
 
-Integration tests start disposable MongoDB replica set and MinIO containers.
-Override `MONGODB_TEST_IMAGE`, `BACKUP_TEST_IMAGE`, or `S3_TEST_IMAGE` to test another image.
+Integration tests start disposable MongoDB replica set and Silo containers.
+The default S3 server is the digest-pinned
+[`pgsty/silo:RELEASE.2026-10-18T00-00-00Z-distroless`](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-10-18T00-00-00Z)
+image. It starts the server directly and does not require a shell or client tools inside the container.
+Silo uses `MINIO_ROOT_USER` and `MINIO_ROOT_PASSWORD` for its root credentials.
+Override `MONGODB_TEST_IMAGE`, `BACKUP_TEST_IMAGE`, or `S3_TEST_IMAGE` to test another image;
+an S3 image override must accept the same server arguments and credential variables.
+For local binaries, set `MONGODB_NATIVE_INTEGRATION=1` and optionally
+`MONGOD_TEST_BINARY`, `SILO_TEST_BINARY`, and `BACKUP_TEST_BINARY`.
+`SILO_TEST_BINARY` replaces `MINIO_TEST_BINARY` and defaults to `silo` on PATH.
 Shell wrappers `/run.sh`, `/backup.sh`, and `/restore.sh` forward to the corresponding Go command.
