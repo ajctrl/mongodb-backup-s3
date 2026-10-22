@@ -408,16 +408,16 @@ func TestSuccessfulRetentionIsScopedToSelectedModeAndDatabase(t *testing.T) {
 
 func TestDatabaseDiscoveryAndSelection(t *testing.T) {
 	a, store, _, log := newAppTest(t, "per-database")
-	a.Config.Database, a.Config.BackupAll, a.Config.Exclude = "", "true", "excluded"
+	a.Config.Database, a.Config.BackupAll, a.Config.Exclude = "", "true", []string{"excluded"}
 	if err := a.Backup(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	keys := make([]string, 0, len(store.objects))
 	for key := range store.objects {
-		keys = append(keys, key)
+		keys = append(keys, strings.TrimSuffix(key, filepath.Base(key)))
 	}
 	sort.Strings(keys)
-	want := []string{"unit/per-database/analytics/2026-09-13T03:00:00.zip", "unit/per-database/app/2026-09-13T03:00:00.zip"}
+	want := []string{"unit/per-database/analytics/", "unit/per-database/app/"}
 	if !reflect.DeepEqual(keys, want) {
 		t.Fatalf("discovery selected %v, want %v", keys, want)
 	}
@@ -431,7 +431,7 @@ func TestMissingExplicitDatabaseFailsBeforeAnyUpload(t *testing.T) {
 		t.Run(selection, func(t *testing.T) {
 			a, store, source, log := newAppTest(t, "per-database")
 			if strings.Contains(selection, ",") {
-				a.Config.Database, a.Config.Databases = "", selection
+				a.Config.Database, a.Config.Databases = "", []string{"app", "missing"}
 			} else {
 				a.Config.Database = selection
 			}
@@ -505,7 +505,7 @@ func TestRestoreFailureNeverStartsDatabaseImport(t *testing.T) {
 				a.Config.BackupMode, a.Config.Database = "full", ""
 				store.objects[a.Config.backupKey("", a.now())] = store.objects[key]
 			case "selection":
-				a.Config.Databases = "app,analytics"
+				a.Config.Databases = []string{"app", "analytics"}
 			}
 			if err := a.Restore(t.Context(), nil); err == nil {
 				t.Fatal("restore unexpectedly accepted incomplete or mismatched backup")

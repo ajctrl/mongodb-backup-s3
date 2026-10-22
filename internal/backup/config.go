@@ -1,6 +1,7 @@
 package backup
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"os"
@@ -20,7 +21,8 @@ var backupSuffixPattern = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{
 
 type Config struct {
 	URI, TLSCA, ReadPreference, ConfigDir                string
-	Database, Databases, BackupAll, Exclude, BackupMode  string
+	Database, BackupAll, BackupMode                      string
+	Databases, Exclude                                   []string
 	Prefix, Passphrase, KeepDays, FilenameMode, Schedule string
 	RestoreDrop                                          bool
 	ParallelCollections                                  int
@@ -43,9 +45,19 @@ func loadConfig(lookup func(string) (string, bool)) (Config, error) {
 	}
 	c := Config{
 		URI: get("MONGODB_URI"), TLSCA: get("MONGODB_TLS_CA_FILE"), ReadPreference: valueOr("MONGODB_READ_PREFERENCE", "primary"), ConfigDir: get("MONGODB_CONFIG_DIR"),
-		Database: get("MONGODB_DATABASE"), Databases: get("MONGODB_DATABASES"), BackupAll: valueOr("MONGODB_BACKUP_ALL", "false"), Exclude: get("MONGODB_DATABASES_EXCLUDE"), BackupMode: valueOr("BACKUP_MODE", "full"),
+		Database: get("MONGODB_DATABASE"), BackupAll: valueOr("MONGODB_BACKUP_ALL", "false"), BackupMode: valueOr("BACKUP_MODE", "full"),
 		Prefix: prefix, Passphrase: get("PASSPHRASE"), KeepDays: get("BACKUP_KEEP_DAYS"), FilenameMode: valueOr("BACKUP_FILENAME_MODE", "timestamp"), Schedule: get("SCHEDULE"),
 		Storage: storage.Config{Bucket: get("S3_BUCKET"), Region: valueOr("S3_REGION", "us-west-1"), Endpoint: get("S3_ENDPOINT"), AccessKeyID: get("S3_ACCESS_KEY_ID"), SecretAccessKey: get("S3_SECRET_ACCESS_KEY"), SessionToken: get("S3_SESSION_TOKEN")},
+	}
+	for _, list := range []struct {
+		name string
+		dest *[]string
+	}{{"MONGODB_DATABASES", &c.Databases}, {"MONGODB_DATABASES_EXCLUDE", &c.Exclude}} {
+		names, err := parseDatabaseList(get(list.name))
+		if err != nil {
+			return c, fmt.Errorf("%s: %w", list.name, err)
+		}
+		*list.dest = names
 	}
 	if p := get("MONGODB_URI_FILE"); p != "" {
 		if c.URI != "" {
@@ -164,21 +176,21 @@ func (c Config) validateBackup() (int, error) {
 		return 0, err
 	}
 	if c.BackupMode == "full" {
-		if c.Database != "" || c.Databases != "" || c.Exclude != "" || c.BackupAll == "true" {
+		if c.Database != "" || len(c.Databases) > 0 || len(c.Exclude) > 0 || c.BackupAll == "true" {
 			return 0, fmt.Errorf("full backup requires clearing all MongoDB database selectors")
 		}
 	} else if c.BackupMode == "per-database" {
-		if c.BackupAll == "true" && (c.Database != "" || c.Databases != "") {
+		if c.BackupAll == "true" && (c.Database != "" || len(c.Databases) > 0) {
 			return 0, fmt.Errorf("MONGODB_BACKUP_ALL cannot be combined with explicit databases")
 		}
-		if c.BackupAll != "true" && c.Database == "" && c.Databases == "" {
+		if c.BackupAll != "true" && c.Database == "" && len(c.Databases) == 0 {
 			return 0, fmt.Errorf("set MONGODB_DATABASE, MONGODB_DATABASES or MONGODB_BACKUP_ALL=true")
 		}
-		if c.Exclude != "" && c.BackupAll != "true" {
+		if len(c.Exclude) > 0 && c.BackupAll != "true" {
 			return 0, fmt.Errorf("MONGODB_DATABASES_EXCLUDE requires MONGODB_BACKUP_ALL=true")
 		}
-		if c.Databases != "" {
-			if err := validateDatabases(parseDatabaseList(c.Databases)); err != nil {
+		if len(c.Databases) > 0 {
+			if err := validateDatabases(c.Databases); err != nil {
 				return 0, err
 			}
 		} else if c.Database != "" {
@@ -186,8 +198,8 @@ func (c Config) validateBackup() (int, error) {
 				return 0, err
 			}
 		}
-		if c.Exclude != "" {
-			if err := validateDatabases(parseDatabaseList(c.Exclude)); err != nil {
+		for _, name := range c.Exclude {
+			if err := validateDatabaseName(name); err != nil {
 				return 0, err
 			}
 		}
@@ -207,12 +219,22 @@ func (c Config) validateBackup() (int, error) {
 	return n, nil
 }
 
-func parseDatabaseList(value string) []string {
-	names := strings.Split(value, ",")
-	for i := range names {
-		names[i] = strings.TrimSpace(names[i])
+func parseDatabaseList(value string) ([]string, error) {
+	if value == "" {
+		return nil, nil
 	}
-	return names
+	var names []string
+	// Require an array, not JSON null. Do not trim individual names: whitespace
+	// may be part of a Linux DB name, and separators may be literal commas.
+	if !utf8.ValidString(value) || !strings.HasPrefix(strings.TrimSpace(value), "[") || json.Unmarshal([]byte(value), &names) != nil {
+		return nil, fmt.Errorf("must be a JSON array of database names (for example [\"app\",\"private,archive\"]); comma-separated lists are no longer supported")
+	}
+	for _, name := range names {
+		if err := validateDatabaseName(name); err != nil {
+			return nil, err
+		}
+	}
+	return names, nil
 }
 func systemDatabase(name string) bool { return name == "admin" || name == "local" || name == "config" }
 func validateDatabases(names []string) error {
@@ -220,12 +242,19 @@ func validateDatabases(names []string) error {
 		return fmt.Errorf("no databases selected")
 	}
 	for _, name := range names {
-		if name == "" || len(name) >= 64 || !utf8.ValidString(name) || strings.ContainsAny(name, "/\\.\"$*<>:|? ") || strings.IndexFunc(name, func(r rune) bool { return r < 32 || r == 127 }) >= 0 {
-			return fmt.Errorf("invalid MongoDB database name")
+		if err := validateDatabaseName(name); err != nil {
+			return err
 		}
 		if systemDatabase(name) {
 			return fmt.Errorf("internal databases require full mode; authentication is included separately in per-database bundles")
 		}
+	}
+	return nil
+}
+func validateDatabaseName(name string) error {
+	// This application runs on Linux; Windows-only restrictions do not apply.
+	if name == "" || len(name) >= 64 || !utf8.ValidString(name) || strings.ContainsAny(name, "/\\.\"$ \x00") {
+		return fmt.Errorf("invalid MongoDB database name %q", name)
 	}
 	return nil
 }

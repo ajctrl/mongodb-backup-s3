@@ -3,6 +3,7 @@ package backup
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -27,13 +28,19 @@ func TestConfigurationSelectionContracts(t *testing.T) {
 		{"full selection", map[string]string{"MONGODB_DATABASE": "app"}, false},
 		{"full discovery", map[string]string{"MONGODB_BACKUP_ALL": "true"}, false},
 		{"per DB", map[string]string{"BACKUP_MODE": "per-database", "MONGODB_DATABASE": "app"}, true},
-		{"multiple", map[string]string{"BACKUP_MODE": "per-database", "MONGODB_DATABASES": "app, analytics"}, true},
-		{"auto", map[string]string{"BACKUP_MODE": "per-database", "MONGODB_BACKUP_ALL": "true", "MONGODB_DATABASES_EXCLUDE": "temp"}, true},
+		{"multiple", map[string]string{"BACKUP_MODE": "per-database", "MONGODB_DATABASES": `["app","analytics"]`}, true},
+		{"auto", map[string]string{"BACKUP_MODE": "per-database", "MONGODB_BACKUP_ALL": "true", "MONGODB_DATABASES_EXCLUDE": `["temp"]`}, true},
+		{"empty arrays in full", map[string]string{"MONGODB_DATABASES": `[]`, "MONGODB_DATABASES_EXCLUDE": `[]`}, true},
+		{"empty array with single DB", map[string]string{"BACKUP_MODE": "per-database", "MONGODB_DATABASE": "private,archive", "MONGODB_DATABASES": `[]`}, true},
+		{"empty array without selector", map[string]string{"BACKUP_MODE": "per-database", "MONGODB_DATABASES": `[]`}, false},
+		{"empty array with discovery", map[string]string{"BACKUP_MODE": "per-database", "MONGODB_BACKUP_ALL": "true", "MONGODB_DATABASES": `[]`}, true},
 		{"no selector", map[string]string{"BACKUP_MODE": "per-database"}, false},
 		{"auto conflict", map[string]string{"BACKUP_MODE": "per-database", "MONGODB_BACKUP_ALL": "true", "MONGODB_DATABASE": "app"}, false},
-		{"blank list member", map[string]string{"BACKUP_MODE": "per-database", "MONGODB_DATABASES": "app,"}, false},
+		{"blank list member", map[string]string{"BACKUP_MODE": "per-database", "MONGODB_DATABASES": `["app",""]`}, false},
 		{"internal DB", map[string]string{"BACKUP_MODE": "per-database", "MONGODB_DATABASE": "admin"}, false},
-		{"wildcard DB", map[string]string{"BACKUP_MODE": "per-database", "MONGODB_DATABASE": "app*"}, false},
+		{"literal star DB", map[string]string{"BACKUP_MODE": "per-database", "MONGODB_DATABASE": "app*"}, true},
+		{"Linux DB", map[string]string{"BACKUP_MODE": "per-database", "MONGODB_DATABASE": "legacy:db"}, true},
+		{"Linux exclusions", map[string]string{"BACKUP_MODE": "per-database", "MONGODB_BACKUP_ALL": "true", "MONGODB_DATABASES_EXCLUDE": `["legacy:db","app*","admin","private,archive"]`}, true},
 		{"bad keep days", map[string]string{"BACKUP_KEEP_DAYS": "-1"}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -44,12 +51,74 @@ func TestConfigurationSelectionContracts(t *testing.T) {
 			for k, v := range tc.env {
 				values[k] = v
 			}
-			c := testConfig(t, values)
-			_, err := c.validateBackup()
+			c, err := loadConfig(func(k string) (string, bool) { v, ok := values[k]; return v, ok })
+			if err == nil {
+				_, err = c.validateBackup()
+			}
 			if (err == nil) != tc.valid {
 				t.Fatalf("validation=%v valid=%v", err, tc.valid)
 			}
 		})
+	}
+}
+
+func TestDatabaseListJSON(t *testing.T) {
+	for _, variable := range []string{"MONGODB_DATABASES", "MONGODB_DATABASES_EXCLUDE"} {
+		for _, tc := range []struct {
+			value   string
+			want    []string
+			invalid bool
+		}{
+			{"", nil, false},
+			{`[]`, nil, false},
+			{" \n [\"private,archive\",\"app\"] \t", []string{"private,archive", "app"}, false},
+			{`["app","app"]`, []string{"app", "app"}, false},
+			{`app,archive`, nil, true},
+			{`"app"`, nil, true},
+			{`null`, nil, true},
+			{`{}`, nil, true},
+			{`[null]`, nil, true},
+			{`[1]`, nil, true},
+			{`["app",""]`, nil, true},
+			{`[" app"]`, nil, true},
+			{`["app",]`, nil, true},
+			{`["app"] []`, nil, true},
+			{"[\"bad\xff\"]", nil, true},
+		} {
+			t.Run(variable+"/"+tc.value, func(t *testing.T) {
+				values := map[string]string{"S3_BUCKET": "bucket", variable: tc.value}
+				c, err := loadConfig(func(k string) (string, bool) { v, ok := values[k]; return v, ok })
+				if tc.invalid {
+					if err == nil || !strings.Contains(err.Error(), variable) {
+						t.Fatalf("expected error naming %s, got %v", variable, err)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				got := c.Databases
+				if variable == "MONGODB_DATABASES_EXCLUDE" {
+					got = c.Exclude
+				}
+				if !slices.Equal(got, tc.want) {
+					t.Fatalf("got %q, want %q", got, tc.want)
+				}
+			})
+		}
+	}
+}
+
+func TestLinuxDatabaseNames(t *testing.T) {
+	for _, name := range []string{"legacy:db", "star*db", "angle<db>", "pipe|db", "question?db", "日本語", strings.Repeat("a", 63)} {
+		if err := validateDatabases([]string{name}); err != nil {
+			t.Fatalf("valid Linux name %q rejected: %v", name, err)
+		}
+	}
+	for _, name := range []string{"", "a/b", `a\b`, "a.b", `a"b`, "a$b", "a b", "a\x00b", "bad\xff", strings.Repeat("a", 64)} {
+		if err := validateDatabases([]string{name}); err == nil {
+			t.Fatalf("invalid MongoDB name %q accepted", name)
+		}
 	}
 }
 func TestConnectionDoesNotChangeDumpScopeOrLeakSecrets(t *testing.T) {

@@ -190,26 +190,14 @@ func (a *App) databases(ctx context.Context, source Source) ([]string, error) {
 				names = append(names, name)
 			}
 		}
-	} else if c.Databases != "" {
-		names = parseDatabaseList(c.Databases)
+	} else if len(c.Databases) > 0 {
+		names = c.Databases
 	} else {
 		names = []string{c.Database}
 	}
-	if err := validateDatabases(names); err != nil {
-		return nil, err
-	}
-	// mongodump can succeed for a nonexistent database. Check every explicit
-	// selection before publishing any bundle from this invocation.
-	for _, name := range names {
-		if !exists[name] {
-			return nil, fmt.Errorf("selected MongoDB database %q does not exist", name)
-		}
-	}
 	excluded := map[string]bool{}
-	if c.Exclude != "" {
-		for _, name := range parseDatabaseList(c.Exclude) {
-			excluded[name] = true
-		}
+	for _, name := range c.Exclude {
+		excluded[name] = true
 	}
 	seen := map[string]bool{}
 	var selected []string
@@ -221,6 +209,16 @@ func (a *App) databases(ctx context.Context, source Source) ([]string, error) {
 	}
 	if len(selected) == 0 {
 		return nil, fmt.Errorf("no databases selected for backup")
+	}
+	if err := validateDatabases(selected); err != nil {
+		return nil, err
+	}
+	// mongodump can succeed for a nonexistent database. Check every selected
+	// database before publishing any bundle from this invocation.
+	for _, name := range selected {
+		if !exists[name] {
+			return nil, fmt.Errorf("selected MongoDB database %q does not exist", name)
+		}
 	}
 	return selected, nil
 }

@@ -149,7 +149,7 @@ func TestBackupRestore(t *testing.T) {
 	if !t.Run("per_database_data_and_explicit_auth_restore", func(t *testing.T) {
 		env := map[string]string{
 			"S3_PREFIX": "selected", "BACKUP_MODE": "per-database", "BACKUP_FILENAME_MODE": "fixed",
-			"MONGODB_DATABASES": "app,analytics",
+			"MONGODB_DATABASES": `["app","analytics"]`,
 		}
 		f.run(t, env, "backup")
 		keys := f.keys(t, "selected/")
@@ -192,7 +192,7 @@ func TestBackupRestore(t *testing.T) {
 	t.Run("database_discovery_and_exclusion", func(t *testing.T) {
 		f.run(t, map[string]string{
 			"S3_PREFIX": "discovered", "BACKUP_MODE": "per-database", "BACKUP_FILENAME_MODE": "fixed",
-			"MONGODB_BACKUP_ALL": "true", "MONGODB_DATABASES_EXCLUDE": "excluded",
+			"MONGODB_BACKUP_ALL": "true", "MONGODB_DATABASES_EXCLUDE": `["excluded"]`,
 		}, "backup")
 		want := "discovered/per-database/analytics/latest.zip,discovered/per-database/app/latest.zip"
 		if got := strings.Join(f.keys(t, "discovered/"), ","); got != want {

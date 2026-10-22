@@ -14,14 +14,14 @@ import (
 func (a *App) validateRestore(args []string) (string, string, error) {
 	c := a.Config
 	if c.BackupMode == "full" {
-		if c.Database != "" || c.Databases != "" || c.Exclude != "" || c.BackupAll == "true" {
+		if c.Database != "" || len(c.Databases) > 0 || len(c.Exclude) > 0 || c.BackupAll == "true" {
 			return "", "", fmt.Errorf("full restore requires clearing database selectors")
 		}
 	} else {
 		if err := validateDatabases([]string{c.Database}); err != nil {
 			return "", "", fmt.Errorf("set MONGODB_DATABASE to the database to restore: %w", err)
 		}
-		if c.Databases != "" || c.Exclude != "" || c.BackupAll == "true" {
+		if len(c.Databases) > 0 || len(c.Exclude) > 0 || c.BackupAll == "true" {
 			return "", "", fmt.Errorf("per-database restore accepts only MONGODB_DATABASE")
 		}
 	}
@@ -96,7 +96,10 @@ func (a *App) restore(ctx context.Context, args []string, auth bool) error {
 			} else if m.Oplog {
 				cmd = append(cmd, "--oplogReplay")
 			} else {
-				cmd = append(cmd, "--nsInclude="+a.Config.Database+".*")
+				// mongorestore treats '*' as a namespace wildcard. Database
+				// names on Linux may contain literal stars; backslash escapes
+				// them in the tool's pattern grammar (not shell quoting).
+				cmd = append(cmd, "--nsInclude="+strings.ReplaceAll(a.Config.Database, "*", `\*`)+".*")
 			}
 			fmt.Fprintf(a.Out, "Restoring backup created with %s (MongoDB %s, FCV %s)...\n", m.ToolsVersion, m.ServerVersion, m.FCV)
 			if err := a.restoreArchive(ctx, r, f, cmd...); err != nil {

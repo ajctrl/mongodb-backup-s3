@@ -93,7 +93,7 @@ This example backs up the entire replica set, including users, roles, and oplog,
 After a successful backup, timestamped backups older than seven days are deleted from the destination.
 Use a separate `S3_PREFIX` for each replica set. For S3-compatible storage, set `S3_ENDPOINT` in `.env`;
 for temporary AWS credentials, also set `S3_SESSION_TOKEN`.
-To back up only selected databases, set `BACKUP_MODE: per-database` and add `MONGODB_DATABASES: app,analytics`
+To back up only selected databases, set `BACKUP_MODE: per-database` and add `MONGODB_DATABASES: '["app","analytics"]'`
 to `environment`; this mode does not include oplog (see [Per-database backups](#per-database-backups)).
 Run an immediate backup only when no scheduled backup is running.
 To include local configuration files, add `MONGODB_CONFIG_DIR` to the existing `environment` mapping
@@ -149,13 +149,21 @@ Restores connect to the writable target; this backup setting does not direct res
 ```dotenv
 BACKUP_MODE=per-database
 MONGODB_DATABASE=
-MONGODB_DATABASES=app,analytics
+MONGODB_DATABASES=["app","analytics"]
 MONGODB_BACKUP_ALL=false
 MONGODB_DATABASES_EXCLUDE=
 ```
 
-Use `MONGODB_DATABASE=app` for a single database or `MONGODB_DATABASES=app,analytics` for multiple databases.
-`MONGODB_DATABASES` takes precedence when both are set.
+Use `MONGODB_DATABASE=app` for a single database or `MONGODB_DATABASES=["app","analytics"]` in a Docker env file for multiple databases.
+A nonempty `MONGODB_DATABASES` array takes precedence when both are set.
+An unset variable, an empty value, or `[]` means no entries.
+
+**Breaking change:** `MONGODB_DATABASES` and `MONGODB_DATABASES_EXCLUDE` now require JSON arrays of strings.
+Old comma-separated values are rejected; replace `app,analytics` with `["app","analytics"]`.
+Names are preserved exactly: `["private,archive"]` selects or excludes the single database named `private,archive`.
+Docker `--env-file` preserves outer quotes literally: use the unquoted JSON arrays shown in these dotenv blocks.
+In a shell assignment, use `MONGODB_DATABASES='["app","analytics"]'`; in a Compose YAML mapping,
+use `MONGODB_DATABASES: '["app","analytics"]'`. Those outer single quotes are shell/YAML syntax only.
 For automatic discovery, clear the explicit selections and use:
 
 ```dotenv
@@ -163,11 +171,14 @@ BACKUP_MODE=per-database
 MONGODB_DATABASE=
 MONGODB_DATABASES=
 MONGODB_BACKUP_ALL=true
-MONGODB_DATABASES_EXCLUDE=scratch,temp
+MONGODB_DATABASES_EXCLUDE=["scratch","temp"]
 ```
 
 `MONGODB_BACKUP_ALL=true` cannot be combined with explicit selections. Exclusions apply only to automatic discovery.
 Discovery excludes `admin`, `config`, and `local`; explicitly selecting these internal databases is also rejected.
+Names follow MongoDB's Linux restrictions, so names such as `legacy:db` and `star*db` are supported.
+Exclusions are applied before validating the selected databases. Literal stars in names are escaped in
+`mongorestore` namespace filters so they do not select other databases.
 Each database bundle includes authentication information in a separate `auth.archive.gz`.
 This is **a dump of the admin database containing users and roles for all databases**, not just the selected database.
 Data and authentication information are captured sequentially for each database, so they are not a single point-in-time snapshot.
@@ -350,9 +361,9 @@ Original ownership and permissions are not restored automatically; adjust them w
 | `MONGODB_RESTORE_DROP` | `false` | Drop target collections before restoring |
 | `BACKUP_MODE` | `full` | `full` / `per-database` |
 | `MONGODB_DATABASE` | Empty | Single database selection or per-database restore target |
-| `MONGODB_DATABASES` | Empty | Comma-separated list of databases to back up |
+| `MONGODB_DATABASES` | Empty | JSON array of exact database names to back up; `[]` means no entries |
 | `MONGODB_BACKUP_ALL` | `false` | Automatically discover application databases |
-| `MONGODB_DATABASES_EXCLUDE` | Empty | Databases to exclude from automatic discovery |
+| `MONGODB_DATABASES_EXCLUDE` | Empty | JSON array of exact names to exclude from automatic discovery |
 | `S3_BUCKET` | Required | Existing destination bucket |
 | `S3_REGION` | `us-west-1` | AWS region |
 | `S3_PREFIX` | `backup` | Object key prefix; use a separate prefix for each replica set |
