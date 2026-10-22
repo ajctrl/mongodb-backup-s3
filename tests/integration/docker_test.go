@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -79,6 +80,32 @@ func TestBackupRestore(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("backup_account_cannot_write", func(t *testing.T) {
+		client := f.connect(t, f.baseEnv["MONGODB_URI"])
+		_, err := client.Database("app").Collection("probe").InsertOne(ctx, bson.M{"_id": "unauthorized-write"})
+		var serverErr mongo.ServerError
+		if !errors.As(err, &serverErr) || !serverErr.HasErrorCode(13) {
+			t.Fatalf("backup account did not reject write with Unauthorized: %v", err)
+		}
+	})
+	for _, mode := range []string{"full", "per-database"} {
+		t.Run("insufficient_privileges_"+mode, func(t *testing.T) {
+			prefix := "insufficient-" + mode
+			env := map[string]string{"S3_PREFIX": prefix, "BACKUP_MODE": mode,
+				"MONGODB_URI": strings.Replace(f.sourceURI, "root:", "insufficient:", 1)}
+			if mode == "per-database" {
+				env["MONGODB_DATABASE"] = "app"
+			}
+			output, err := f.runCommand(t, env, "backup")
+			if err == nil || !strings.Contains(output, "lacks required privileges (code 13)") {
+				t.Fatalf("expected authorization failure, got %v: %s", err, output)
+			}
+			if keys := f.keys(t, prefix+"/"); len(keys) != 0 {
+				t.Fatalf("unauthorized backup published %v", keys)
+			}
+		})
+	}
 
 	if !t.Run("full_oplog_concurrent_writes_and_auth", func(t *testing.T) {
 		var completed atomic.Int64
@@ -343,7 +370,7 @@ func newFixture(t *testing.T, ctx context.Context) *fixture {
 				t.Fatal(err)
 			}
 			startProcess(t, mongod, nil, "--dbpath", dir, "--bind_ip", "127.0.0.1", "--port", server.port,
-				"--replSet", server.set, "--keyFile", key, "--oplogSize", "128")
+				"--replSet", server.set, "--keyFile", key, "--oplogSize", "128", "--setParameter", "enableTestCommands=1")
 		}
 		startProcess(t, silo, []string{"MINIO_ROOT_USER=integration", "MINIO_ROOT_PASSWORD=" + testPassword},
 			"server", "--address", "127.0.0.1:"+s3Port, "--console-address", "127.0.0.1:"+unusedPort(t), t.TempDir())
@@ -362,7 +389,7 @@ func newFixture(t *testing.T, ctx context.Context) *fixture {
 			args := append([]string{"run", "-d", "--name", name}, networkArgs...)
 			args = append(args, "-e", "MONGO_INITDB_ROOT_USERNAME=root", "-e", "MONGO_INITDB_ROOT_PASSWORD="+testPassword)
 			args = append(args, "--entrypoint", "bash", mongoImage, "-c",
-				"printf '%s' "+testReplicaKey+" >/tmp/test-key; chmod 600 /tmp/test-key; chown mongodb:mongodb /tmp/test-key; exec docker-entrypoint.sh mongod --bind_ip_all --port "+port+" --replSet "+set+" --keyFile /tmp/test-key --oplogSize 128")
+				"printf '%s' "+testReplicaKey+" >/tmp/test-key; chmod 600 /tmp/test-key; chown mongodb:mongodb /tmp/test-key; exec docker-entrypoint.sh mongod --bind_ip_all --port "+port+" --replSet "+set+" --keyFile /tmp/test-key --oplogSize 128 --setParameter enableTestCommands=1")
 			docker(t, ctx, args...)
 		}
 		startMongo(f.anchor, sourcePort, "source", []string{
@@ -387,6 +414,18 @@ func newFixture(t *testing.T, ctx context.Context) *fixture {
 		}
 		f.initializeReplica(t, server.port, server.set)
 	}
+
+	// Backups use only the documented built-in roles. Fixture setup and
+	// restores retain a separate administrator account.
+	admin := f.connect(t, f.sourceURI).Database("admin")
+	f.command(t, admin, bson.D{
+		{Key: "createUser", Value: "backup"}, {Key: "pwd", Value: testPassword},
+		{Key: "roles", Value: bson.A{"backup", "clusterMonitor"}},
+	})
+	f.command(t, admin, bson.D{
+		{Key: "createUser", Value: "insufficient"}, {Key: "pwd", Value: testPassword},
+		{Key: "roles", Value: bson.A{"readAnyDatabase"}},
+	})
 	f.s3 = s3.NewFromConfig(aws.Config{
 		Region: "us-east-1", Credentials: credentials.NewStaticCredentialsProvider("integration", testPassword, ""),
 		HTTPClient: &http.Client{Timeout: 30 * time.Second},
@@ -413,7 +452,7 @@ func newFixture(t *testing.T, ctx context.Context) *fixture {
 		configPath = "/fixtures"
 	}
 	f.baseEnv = map[string]string{
-		"MONGODB_URI": f.sourceURI, "MONGODB_CONFIG_DIR": configPath,
+		"MONGODB_URI": strings.Replace(f.sourceURI, "root:", "backup:", 1), "MONGODB_CONFIG_DIR": configPath,
 		"MONGODB_READ_PREFERENCE": "primary", "MONGODB_TLS_CA_FILE": "", "MONGODB_RESTORE_DROP": "false", "MONGODB_PARALLEL_COLLECTIONS": "4",
 		"S3_BUCKET": f.bucket, "S3_REGION": "us-east-1", "S3_ENDPOINT": f.endpoint,
 		"S3_ACCESS_KEY_ID": "integration", "S3_SECRET_ACCESS_KEY": testPassword, "S3_SESSION_TOKEN": "",
@@ -586,6 +625,13 @@ func (f *fixture) run(t *testing.T, overrides map[string]string, args ...string)
 }
 
 func (f *fixture) runCommand(t *testing.T, overrides map[string]string, args ...string) (string, error) {
+	cmd, _ := f.backupCommand(t, overrides, args...)
+	output, err := cmd.CombinedOutput()
+	return string(output), err
+}
+
+// backupCommand also supports asynchronous runs that receive real OS signals.
+func (f *fixture) backupCommand(t *testing.T, overrides map[string]string, args ...string) (*exec.Cmd, func(syscall.Signal) error) {
 	t.Helper()
 	env := make(map[string]string, len(f.baseEnv)+len(overrides))
 	for key, value := range f.baseEnv {
@@ -600,16 +646,18 @@ func (f *fixture) runCommand(t *testing.T, overrides map[string]string, args ...
 	}
 	sort.Strings(keys)
 	var cmd *exec.Cmd
+	var sendSignal func(syscall.Signal) error
 	if f.native {
 		cmd = exec.CommandContext(f.ctx, f.binary, args...)
 		cmd.Env = os.Environ()
 		for _, key := range keys {
 			cmd.Env = append(cmd.Env, key+"="+env[key])
 		}
+		sendSignal = func(sig syscall.Signal) error { return cmd.Process.Signal(sig) }
 	} else {
 		f.runNumber++
 		name := fmt.Sprintf("%s-run-%d", f.name, f.runNumber)
-		defer dockerCleanup(t, "rm", "-f", "-v", name)
+		t.Cleanup(func() { dockerCleanup(t, "rm", "-f", "-v", name) })
 		dockerArgs := []string{"run", "--rm", "--name", name, "--network", "container:" + f.anchor,
 			"--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
 			"-e", "HOME=/tmp",
@@ -621,9 +669,15 @@ func (f *fixture) runCommand(t *testing.T, overrides map[string]string, args ...
 		dockerArgs = append(dockerArgs, f.image, "mongodb-backup-s3")
 		dockerArgs = append(dockerArgs, args...)
 		cmd = exec.CommandContext(f.ctx, "docker", dockerArgs...)
+		sendSignal = func(sig syscall.Signal) error {
+			output, err := exec.CommandContext(f.ctx, "docker", "kill", "--signal", strconv.Itoa(int(sig)), name).CombinedOutput()
+			if err != nil {
+				return fmt.Errorf("signal container: %w: %s", err, output)
+			}
+			return nil
+		}
 	}
-	output, err := cmd.CombinedOutput()
-	return string(output), err
+	return cmd, sendSignal
 }
 
 func (f *fixture) keys(t *testing.T, prefix string) []string {

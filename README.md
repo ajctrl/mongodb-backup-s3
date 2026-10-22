@@ -413,6 +413,13 @@ go test -count=1 -tags=integration -v -timeout=20m ./tests/integration
 ```
 
 Integration tests start disposable MongoDB replica set and Silo containers.
+Backup commands use a dedicated account with only `backup` and `clusterMonitor` roles;
+fixture setup and restores use a separate administrator. Tests also verify that insufficient privileges
+prevent publication and that conditional writes preserve existing generations.
+Tests cover literal commas in JSON database selections/exclusions, scheduled recurrence after failures,
+overlap prevention, and SIGTERM/SIGINT during schedule waits and active multipart uploads.
+Shutdown checks require the expected exit code, no completed partial backup, aborted uploaded parts,
+and released locks. Only disposable test MongoDB instances enable failpoints to hold an active dump.
 The default S3 server is the digest-pinned
 [`pgsty/silo:RELEASE.2026-10-18T00-00-00Z-distroless`](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-10-18T00-00-00Z)
 image. It starts the server directly and does not require a shell or client tools inside the container.
