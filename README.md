@@ -16,7 +16,7 @@ Designed for self-managed replica sets. Sharded clusters, standalone servers, an
 
 ## Usage
 
-Supports Linux amd64 / arm64 and includes `mongodump` and `mongorestore` from MongoDB Database Tools **100.18.0**.
+Supports Linux amd64 / arm64 and includes `mongodump` and `mongorestore` from MongoDB Database Tools **100.19.1**.
 Integration tests target MongoDB 8.0. Verify restores with the same Server / FCV / Tools combination used in production.
 
 After the first image is published to GHCR, run it with the following commands.
@@ -120,6 +120,20 @@ MONGODB_READ_PREFERENCE=primary
 To supply the URI through a secret file, leave `MONGODB_URI` empty, set `MONGODB_URI_FILE=/run/secrets/mongodb_uri`,
 and mount the file read-only. Setting both variables is an error.
 The URI is passed to child processes through a temporary configuration file with `0600` permissions, rather than command-line arguments.
+
+MongoDB Tools 100.19.1 fixes an earlier bug that interpreted URI timeout milliseconds as seconds.
+**Breaking change:** when specified, `serverSelectionTimeoutMS` and `connectTimeoutMS` must be positive
+multiples of 1,000 (for example, `2000` for two seconds). Zero, fractional seconds, repeated values, and
+out-of-range values are rejected because the tools only preserve whole seconds.
+These options control MongoDB Tools; metadata operations retain their separate 30-second limit.
+Custom images must use Tools 100.19.1 or later and pass the timeout integration tests.
+
+**Breaking change:** `socketTimeoutMS` and `timeoutMS` are rejected, including zero or empty values.
+MongoDB Tools 100.19.1 accepts these options but does not enforce them; remove them from the URI.
+This applies to both `MONGODB_URI` and `MONGODB_URI_FILE`, regardless of option-name capitalization.
+Connection and server-selection timeouts do not bound operations after connection, and this application
+does not provide a MongoDB operation timeout. The metadata client's 30-second limit does not apply to
+`mongodump` or `mongorestore`. An operation that stops responding may require cancellation with SIGTERM/SIGINT.
 
 Enable TLS with `tls=true` in the URI. For a custom CA, mount the CA file and set `MONGODB_TLS_CA_FILE` to its container path.
 Certificates collected as server configuration are not automatically applied to connection settings.
@@ -420,6 +434,8 @@ fixture setup and restores use a separate administrator. Tests also verify that 
 prevent publication and that conditional writes preserve existing generations.
 Tests cover literal commas in JSON database selections/exclusions, scheduled recurrence after failures,
 overlap prevention, and SIGTERM/SIGINT during schedule waits and active multipart uploads.
+Timeout tests run both installed tools against an unresponsive TCP endpoint and measure one- and two-second
+server-selection and connection timeouts. In Docker mode these tests use the host network on Linux.
 Shutdown checks require the expected exit code, no completed partial backup, aborted uploaded parts,
 and released locks. Only disposable test MongoDB instances enable failpoints to hold an active dump.
 The default S3 server is the digest-pinned

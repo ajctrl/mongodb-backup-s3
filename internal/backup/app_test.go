@@ -204,6 +204,44 @@ func readAppCommandLog(t *testing.T, path string) string {
 	return string(b)
 }
 
+func TestUnsupportedOperationTimeoutsStartNoWork(t *testing.T) {
+	for _, key := range []string{"socketTimeoutMS", "timeoutMS"} {
+		for _, command := range []string{"backup", "run", "restore", "restore-auth"} {
+			t.Run(key+"/"+command, func(t *testing.T) {
+				a, store, _, log := newAppTest(t, "per-database")
+				a.Config.URI += "&" + key + "=1000"
+				a.newSource = func(context.Context, Config) (Source, error) {
+					t.Fatal("invalid timeout opened a MongoDB connection")
+					return nil, errors.New("unexpected connection")
+				}
+				var err error
+				switch command {
+				case "backup":
+					err = a.Backup(t.Context())
+				case "run":
+					a.Config.Schedule = "@every 1h"
+					ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+					defer cancel()
+					err = a.Run(ctx)
+				case "restore":
+					err = a.Restore(t.Context(), nil)
+				case "restore-auth":
+					err = a.RestoreAuth(t.Context(), nil)
+				}
+				if err == nil || !strings.Contains(err.Error(), "does not support") {
+					t.Fatalf("unsupported operation timeout was not rejected: %v", err)
+				}
+				if store.uploads != 0 || store.lists != 0 || store.downloadedKey != "" || readAppCommandLog(t, log) != "" {
+					t.Fatal("invalid timeout started S3 or external tool work")
+				}
+				if _, err := os.Stat(a.lockPath); !os.IsNotExist(err) {
+					t.Fatalf("invalid timeout accessed the backup lock: %v", err)
+				}
+			})
+		}
+	}
+}
+
 func TestBackupAndRestoreToolModes(t *testing.T) {
 	for _, mode := range []string{"full", "per-database"} {
 		t.Run(mode, func(t *testing.T) {

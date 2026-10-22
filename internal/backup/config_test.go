@@ -154,6 +154,60 @@ func TestURIFileAndExtractWithoutSource(t *testing.T) {
 		t.Fatal("backup without URI accepted")
 	}
 }
+
+func TestURITimeoutPrecision(t *testing.T) {
+	for _, key := range []string{"serverSelectionTimeoutMS", "connectTimeoutMS", "CONNECTTIMEOUTMS", "%73erverSelectionTimeoutMS"} {
+		for _, value := range []string{"0", "1", "999", "1500", "-1000", "", "SECRET", "9223372037000", "1000&" + key + "=2000"} {
+			uri := "mongodb://user:SECRET@host/?" + key + "=" + value
+			for _, fromFile := range []bool{false, true} {
+				values := map[string]string{"S3_BUCKET": "bucket", "MONGODB_URI": uri}
+				if fromFile {
+					path := filepath.Join(t.TempDir(), "uri")
+					if err := os.WriteFile(path, []byte(uri+"\n"), 0600); err != nil {
+						t.Fatal(err)
+					}
+					delete(values, "MONGODB_URI")
+					values["MONGODB_URI_FILE"] = path
+				}
+				_, err := loadConfig(func(k string) (string, bool) { v, ok := values[k]; return v, ok })
+				if err == nil || strings.Contains(err.Error(), "SECRET") {
+					t.Fatalf("unsafe timeout validation for key=%s value=%s file=%t: %v", key, value, fromFile, err)
+				}
+			}
+		}
+	}
+	for _, query := range []string{"serverSelectionTimeoutMS=1000", "connectTimeoutMS=2000", "connectTimeoutMS=1000&serverSelectionTimeoutMS=2000"} {
+		testConfig(t, map[string]string{"S3_BUCKET": "bucket", "MONGODB_URI": "mongodb://host/?" + query})
+	}
+	for _, query := range []string{"connectTimeoutMS=1000&CONNECTTIMEOUTMS=2000", "serverSelectionTimeoutMS=1000&SERVERSELECTIONTIMEOUTMS=2000"} {
+		if err := validateURI("mongodb://host/?" + query); err == nil {
+			t.Fatalf("case-insensitive duplicate accepted: %s", query)
+		}
+	}
+}
+func TestUnsupportedOperationTimeoutsRejected(t *testing.T) {
+	for _, key := range []string{"socketTimeoutMS", "timeoutMS", "SOCKETTIMEOUTMS", "TimeOutMS", "socket%54imeoutMS", "%74imeoutMS"} {
+		for _, value := range []string{"1000", "0", "", "SECRET", "1000&" + key + "=2000"} {
+			uri := "mongodb://user:SECRET@host/?connectTimeoutMS=1000&" + key + "=" + value
+			for _, fromFile := range []bool{false, true} {
+				values := map[string]string{"S3_BUCKET": "bucket", "MONGODB_URI": uri}
+				if fromFile {
+					path := filepath.Join(t.TempDir(), "uri")
+					if err := os.WriteFile(path, []byte(uri+"\n"), 0600); err != nil {
+						t.Fatal(err)
+					}
+					delete(values, "MONGODB_URI")
+					values["MONGODB_URI_FILE"] = path
+				}
+				_, err := loadConfig(func(k string) (string, bool) { v, ok := values[k]; return v, ok })
+				if err == nil || !strings.Contains(err.Error(), "does not support") || strings.Contains(err.Error(), "SECRET") {
+					t.Fatalf("unsupported timeout key=%s file=%t was not safely rejected: %v", key, fromFile, err)
+				}
+			}
+		}
+	}
+}
+
 func TestModeScopeAndRetentionMatching(t *testing.T) {
 	stamp := time.Date(2026, 9, 13, 3, 0, 0, 0, time.UTC)
 	full := Config{BackupMode: "full", Prefix: "backups/", FilenameMode: "timestamp"}

@@ -12,7 +12,7 @@ case "${TARGETARCH:-$(dpkg --print-architecture)}" in
     *) echo 'Only linux/amd64 and linux/arm64 are supported.' >&2; exit 1 ;;
 esac
 
-tools_version=${MONGODB_TOOLS_VERSION:-100.18.0}
+tools_version=${MONGODB_TOOLS_VERSION:-100.19.1}
 tools_name="mongodb-database-tools-ubuntu2404-${tools_arch}-${tools_version}"
 tools_dir=$(mktemp -d)
 trap 'rm -rf "$tools_dir"' EXIT HUP INT TERM

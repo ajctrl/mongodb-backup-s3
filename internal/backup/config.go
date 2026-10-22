@@ -134,10 +134,28 @@ func validateURI(raw string) error {
 	if err != nil {
 		return fmt.Errorf("invalid MONGODB_URI query")
 	}
-	for key := range q {
-		switch strings.ToLower(key) {
+	seenTimeouts := make(map[string]bool, 2)
+	for key, values := range q {
+		option := strings.ToLower(key)
+		switch option {
 		case "readpreference", "readpreferencetags", "maxstalenessseconds":
 			return fmt.Errorf("use MONGODB_READ_PREFERENCE instead of read preference URI options")
+		case "sockettimeoutms", "timeoutms":
+			// Tools 100.19.1 accepts these URI options but does not apply an
+			// operation timeout. Do not silently promise a bound on stalled I/O.
+			return fmt.Errorf("MongoDB Tools does not support socketTimeoutMS or timeoutMS; remove these options from MONGODB_URI")
+		case "serverselectiontimeoutms", "connecttimeoutms":
+			// Tools 100.19.1 fixes the 1000x unit error, but still converts
+			// URI milliseconds to integer seconds. Reject truncation and zero
+			// (which can select a default or disable a timeout).
+			if len(values) != 1 || seenTimeouts[option] {
+				return fmt.Errorf("MONGODB_URI timeout options must not be repeated")
+			}
+			seenTimeouts[option] = true
+			milliseconds, err := strconv.ParseInt(values[0], 10, 64)
+			if err != nil || milliseconds < 1000 || milliseconds%1000 != 0 || milliseconds > int64((1<<63-1)/time.Millisecond) {
+				return fmt.Errorf("MONGODB_URI serverSelectionTimeoutMS and connectTimeoutMS must be positive whole seconds expressed in milliseconds (e.g. 2000)")
+			}
 		}
 	}
 	return nil
