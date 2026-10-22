@@ -14,12 +14,65 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws/retry"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
 type failingStream struct {
 	io.Reader
 	err error
+}
+
+// Exercise the real unknown-length upload path with a smaller part-count limit
+// rather than sending 80 GiB. Part sizes still satisfy S3's 5 MiB minimum.
+func TestStreamingUploadPartCountBoundary(t *testing.T) {
+	const maxParts = 2
+	for _, partMiB := range []int64{5, 6} {
+		for _, extra := range []int64{-1, 0, 1} {
+			t.Run(fmt.Sprintf("partMiB=%d/extra=%d", partMiB, extra), func(t *testing.T) {
+				partSize := partMiB * 1024 * 1024
+				var aborted, published atomic.Bool
+				var transferred atomic.Int64
+				s := testS3(t, func(w http.ResponseWriter, r *http.Request) {
+					switch {
+					case r.Method == http.MethodPost && r.URL.Query().Has("uploads"):
+						writeXML(w, `<InitiateMultipartUploadResult><UploadId>boundary</UploadId></InitiateMultipartUploadResult>`)
+					case r.Method == http.MethodPut && r.URL.Query().Has("partNumber"):
+						n, err := io.Copy(io.Discard, r.Body)
+						if err != nil || n > partSize {
+							t.Errorf("part size=%d, limit=%d, error=%v", n, partSize, err)
+						}
+						transferred.Add(n)
+						w.Header().Set("ETag", `"part"`)
+					case r.Method == http.MethodPost:
+						published.Store(true)
+						writeXML(w, `<CompleteMultipartUploadResult><ETag>"complete"</ETag></CompleteMultipartUploadResult>`)
+					case r.Method == http.MethodDelete:
+						aborted.Store(true)
+						w.WriteHeader(http.StatusNoContent)
+					default:
+						t.Errorf("unexpected boundary request: %s %s", r.Method, r.URL)
+					}
+				})
+				s.uploadPartSize = partSize
+				s.transfer = transfermanager.New(s.client, func(o *transfermanager.Options) {
+					o.MaxUploadParts = maxParts
+					o.FailTimeout = time.Second
+				})
+				size := partSize*maxParts + extra
+				// Hide Seek/length exactly as the production io.PipeReader does.
+				body := io.NopCloser(bytes.NewBuffer(make([]byte, size)))
+				err := s.Upload(t.Context(), "boundary.zip", body, false)
+				if extra <= 0 {
+					if err != nil || !published.Load() || aborted.Load() || transferred.Load() != size {
+						t.Fatalf("boundary upload: error=%v published=%v aborted=%v bytes=%d/%d", err, published.Load(), aborted.Load(), transferred.Load(), size)
+					}
+				} else if err == nil || !strings.Contains(err.Error(), "MaxUploadParts") || published.Load() || !aborted.Load() {
+					t.Fatalf("oversized upload: error=%v published=%v aborted=%v", err, published.Load(), aborted.Load())
+				}
+			})
+		}
+	}
 }
 
 func (r failingStream) Read(p []byte) (int, error) {

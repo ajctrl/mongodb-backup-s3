@@ -305,6 +305,23 @@ Duration depends on compression CPU usage, network speed, and database read load
 `full` requires the oplog to cover the entire dump, so allow enough retention for increases in write volume.
 Avoid operations that `mongodump --oplog` does not support during a dump, such as renaming collections.
 
+Streaming uploads have an unknown final size, so the SDK cannot automatically increase the part size.
+S3 permits at most 10,000 parts: the maximum **compressed/encrypted bundle size** is
+`S3_UPLOAD_PART_SIZE_MB × 10,000 MiB`, including configuration and archive overhead.
+
+| `S3_UPLOAD_PART_SIZE_MB` | Maximum output size |
+| --- | --- |
+| `8` (default) | 78.125 GiB |
+| `64` | 625 GiB |
+| `128` | 1,250 GiB |
+
+For larger backups, increase the existing `S3_UPLOAD_PART_SIZE_MB` setting before running the backup,
+allowing headroom for growth. For example, use `S3_UPLOAD_PART_SIZE_MB=64` for an expected 100 GiB output.
+Exceeding the limit fails the upload after reading and transferring data; it does not publish the incomplete
+generation or run retention. Increasing the part size also increases RAM use: two parts can upload concurrently,
+with additional read buffers and SDK overhead. The setting is not a total memory limit; leave memory for
+MongoDB Tools and GPG too. No additional backup-size setting is required.
+
 Database names and S3 keys are quoted and escaped in application logs so control characters cannot create
 extra log records. The actual database names and S3 keys are unchanged; log parsers must account for the quotes.
 
@@ -411,7 +428,7 @@ Original ownership and permissions are not restored automatically; adjust them w
 | `S3_ENDPOINT` | Empty | HTTP(S) endpoint for S3-compatible storage; uses path-style access |
 | `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | Empty | Optional credentials; AWS SDK credential providers are also supported |
 | `S3_SESSION_TOKEN` | Empty | Token for temporary credentials |
-| `S3_UPLOAD_PART_SIZE_MB` | `8` | Multipart buffer size in MiB; 5–5120 |
+| `S3_UPLOAD_PART_SIZE_MB` | `8` | Multipart part size in MiB; 5–5120. Streaming output limit is 10,000 parts; see the size table above. |
 | `SCHEDULE` | Empty | Cron expression, cron with seconds, `@daily`, etc. |
 | `BACKUP_KEEP_DAYS` | Empty | Delete expired backups after success; 1–36500 days |
 | `BACKUP_FILENAME_MODE` | `timestamp` | `timestamp` / `fixed` |
@@ -439,7 +456,9 @@ prevent publication and that conditional writes preserve existing generations.
 Tests cover literal commas in JSON database selections/exclusions, scheduled recurrence after failures,
 overlap prevention, and SIGTERM/SIGINT during schedule waits and active multipart uploads.
 Control-character database names are backed up and restored without changing the names, and application
-log tests verify escaping on success, failure, retention, and download paths.
+log tests verify escaping on success, failure, retention, and download paths. Streaming upload tests reduce
+the SDK's part-count limit to exercise the exact size boundary and one byte over it with multiple part sizes,
+including aborting oversized uploads without publication.
 Connection tests add a non-voting secondary and reject data and replica metadata reads on the primary while backing up,
 so both the Go metadata commands and MongoDB Tools' data reads must use the secondary. The tests repeat with TLS and a freshly
 generated private CA, restore to a primary, and reject an unrelated CA and a mismatched hostname in both
