@@ -12,7 +12,7 @@ import (
 	"github.com/ajctrl/mongodb-backup-s3/internal/storage"
 )
 
-const usage = "Usage: mongodb-backup-s3 [run | backup | restore [timestamp | --version-id ID] | restore-auth [timestamp | --version-id ID] | extract-config OUTPUT_DIR [timestamp | --version-id ID]]"
+const usage = "Usage: mongodb-backup-s3 [run | backup | restore [generation | --version-id ID] | restore-auth [generation | --version-id ID] | extract-config OUTPUT_DIR [generation | --version-id ID]]"
 
 func main() { os.Exit(run()) }
 

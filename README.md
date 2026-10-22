@@ -232,9 +232,9 @@ If dumping, configuration collection, or encryption fails, the incomplete backup
 This keeps data and configuration from different backup generations from being mixed.
 
 ```text
-backup/full/2026-09-13T03:00:00.zip.gpg
-backup/per-database/app/2026-09-13T03:00:00.zip.gpg
-backup/per-database/analytics/2026-09-13T03:00:01.zip.gpg
+backup/full/2026-09-13T03:00:00-0123456789abcdef0123456789abcdef.zip.gpg
+backup/per-database/app/2026-09-13T03:00:00-0123456789abcdef0123456789abcdef.zip.gpg
+backup/per-database/analytics/2026-09-13T03:00:01-fedcba9876543210fedcba9876543210.zip.gpg
 ```
 
 After decryption, the bundle has the following structure. `data.archive.gz` uses MongoDB's own archive format.
@@ -250,15 +250,37 @@ manifest.json         # Format, version, capture time, file SHA-256 hashes, etc.
 Unencrypted bundles use `.zip`; encrypted bundles use `.zip.gpg`. Database names in paths are URL-encoded.
 Separate directories for each mode keep latest-backup lookup and deletion scoped to that mode.
 Use a separate `S3_PREFIX` for each source replica set.
-Filename timestamps are UTC, independent of the timezone used for scheduling.
+Generation names contain a UTC timestamp and a random 128-bit ID, independent of the scheduling timezone.
+The full S3 key is logged when an upload starts. Timestamp-mode uploads use `If-None-Match: *`
+on both single-part writes and multipart completion to refuse replacement of an existing key.
+The S3 service must support these conditional writes; errors do not fall back to overwriting.
+This adds a compatibility requirement for S3-compatible services that did not implement conditional multipart completion.
+If the completion time precedes the start time (a wall-clock rollback), the backup fails before publication and retention is skipped.
+
+**Breaking change:** timestamp-only filenames from earlier versions are no longer selected by latest-backup lookup,
+accepted as restore arguments, or managed by retention. Restore arguments now use the entire generation name
+without `.zip` or `.zip.gpg`. Latest-backup lookup uses S3 `LastModified`. If multiple generations share
+the newest S3 timestamp, each tied bundle is downloaded and validated, and the manifest's `completed_at`
+selects the latest one. If that completion time is also tied, automatic restore stops and requires an
+explicit generation; random IDs no longer break ties. An unreadable or invalid candidate also stops selection.
+Fixed-name objects and their version-ID selection retain the same naming format.
 
 `BACKUP_FILENAME_MODE=fixed` overwrites `full/latest.zip[.gpg]` or `per-database/<DB>/latest.zip[.gpg]`.
 Before uploading with a fixed filename, the tool checks bucket versioning and stops if it is disabled.
-If the check itself fails, for example because of insufficient permissions, it logs a warning and continues, matching the MariaDB version's behavior.
+If the check itself fails, for example because of insufficient permissions, the backup stops without uploading.
+This changes the previous warning-and-continue behavior; the backup account needs `s3:GetBucketVersioning`.
 Enable versioning beforehand.
 
 After a successful backup, `BACKUP_KEEP_DAYS` deletes expired timestamped backups in the target directory.
-Expiration is based on the S3 last-modified time. Fixed filenames and previous object versions are not deleted.
+Expiration compares S3 last-modified times against the newly uploaded object's S3 timestamp, rather than the host clock.
+The newly uploaded generation and the newest timestamp generation (including ties) are always retained,
+even if their retention period has elapsed. This also preserves the newest timestamp generation when switching to fixed filenames.
+Before any deletion, the uploaded object must be present in the listing with a valid timestamp, and all managed
+objects must have timestamps. The uploaded object's S3 timestamp must fall within the local backup start/end interval,
+with a five-minute tolerance on either side; this accommodates multipart uploads timestamped at initiation.
+If these checks fail or the local clock moves backwards, the saved backup remains available, retention performs no deletions,
+and the command reports failure (scheduled runs log the failure).
+Fixed filenames and previous object versions are not deleted.
 Use S3 Lifecycle rules to manage their retention and clean up incomplete multipart uploads.
 
 Backups stream through archive → ZIP → optional GPG encryption → S3.
@@ -278,6 +300,7 @@ A restore is not a transaction that rolls back on failure; partially written dat
 The entire S3 object is downloaded, decrypted, and checked for ZIP, manifest, and hash validity before import starts.
 Archives are read from the validated ZIP and streamed to `mongorestore` through standard input.
 Temporary disk space must accommodate one bundle without encryption, or both the encrypted and decrypted bundles with encryption.
+When the latest S3 timestamp is tied, selection can temporarily retain two such bundles while comparing candidates.
 No additional space is needed to extract the import archive as a separate file.
 Provide enough space through `TMPDIR` or a disk mounted at `/tmp`.
 Restore time also includes index rebuilding and oplog replay after import.
@@ -286,9 +309,9 @@ Restore time also includes index rebuilding and oplog replay after import.
 # Latest backup
 docker run --rm --env-file restore.env ghcr.io/ajctrl/mongodb-backup-s3:latest mongodb-backup-s3 restore
 
-# Specific timestamp
+# Specific generation (filename without the extension)
 docker run --rm --env-file restore.env ghcr.io/ajctrl/mongodb-backup-s3:latest \
-  mongodb-backup-s3 restore 2026-09-13T03:00:00
+  mongodb-backup-s3 restore 2026-09-13T03:00:00-0123456789abcdef0123456789abcdef
 
 # Previous version of a fixed-name object
 docker run --rm --env-file restore.env -e BACKUP_FILENAME_MODE=fixed \
@@ -323,7 +346,7 @@ docker run --rm --env-file restore.env \
   ghcr.io/ajctrl/mongodb-backup-s3:latest mongodb-backup-s3 restore-auth
 ```
 
-`restore-auth` also accepts a timestamp or `--version-id`. It is not used with `full`, which includes authentication information in the main archive.
+`restore-auth` also accepts a generation name or `--version-id`. It is not used with `full`, which includes authentication information in the main archive.
 Use a restore account separate from the backup account.
 The `restore` role is the baseline for ordinary data restores, but oplog replay requires additional permissions.
 MongoDB documents a dedicated role with `anyAction` on `anyResource` for oplog replay.
@@ -339,7 +362,7 @@ docker run --rm --env-file restore.env -e MONGODB_URI= -e MONGODB_URI_FILE= \
   ghcr.io/ajctrl/mongodb-backup-s3:latest mongodb-backup-s3 extract-config /recovered/generation
 ```
 
-`extract-config OUTPUT_DIR [TIMESTAMP | --version-id VERSION_ID]` extracts `replica-set.json`, `manifest.json`, and `config/`
+`extract-config OUTPUT_DIR [GENERATION | --version-id VERSION_ID]` extracts `replica-set.json`, `manifest.json`, and `config/`
 without connecting to MongoDB. It rejects an output directory that already exists.
 Even when extracting only configuration, it downloads and decrypts the entire bundle and validates every entry before extraction.
 Hashes detect changes or corruption. Hashes in an unencrypted ZIP are not signatures proving the source's authenticity.

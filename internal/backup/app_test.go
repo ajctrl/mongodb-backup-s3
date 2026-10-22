@@ -36,21 +36,27 @@ func (s *appTestSource) Databases(context.Context) ([]string, error) { return s.
 func (s *appTestSource) Close(context.Context) error                 { s.closed = true; return nil }
 
 type appTestStore struct {
-	objects       map[string][]byte
-	modified      map[string]time.Time
-	deleted       []string
-	uploads       int
-	lists         int
-	versions      bool
-	uploadErr     error
-	downloadErr   error
-	downloadedKey string
-	versionID     string
+	objects         map[string][]byte
+	modified        map[string]time.Time
+	deleted         []string
+	uploads         int
+	lists           int
+	versions        bool
+	versionErr      error
+	lastUploadedKey string
+	allowOverwrite  bool
+	uploadErr       error
+	downloadErr     error
+	downloadedKey   string
+	versionID       string
 }
 
-func (s *appTestStore) VersioningEnabled(context.Context) (bool, error) { return s.versions, nil }
-func (s *appTestStore) Upload(ctx context.Context, key string, body io.ReadCloser) error {
+func (s *appTestStore) VersioningEnabled(context.Context) (bool, error) {
+	return s.versions, s.versionErr
+}
+func (s *appTestStore) Upload(ctx context.Context, key string, body io.ReadCloser, allowOverwrite bool) error {
 	s.uploads++
+	s.lastUploadedKey, s.allowOverwrite = key, allowOverwrite
 	defer body.Close()
 	if s.uploadErr != nil {
 		return s.uploadErr
@@ -63,6 +69,9 @@ func (s *appTestStore) Upload(ctx context.Context, key string, body io.ReadClose
 		return err
 	}
 	// Model S3 multipart completion: failed streams never publish their bytes.
+	if _, exists := s.objects[key]; exists && !allowOverwrite {
+		return errors.New("PreconditionFailed")
+	}
 	s.objects[key] = b
 	s.modified[key] = time.Date(2026, 9, 13, 3, 0, 0, 0, time.UTC)
 	return nil
@@ -224,7 +233,7 @@ func TestBackupAndRestoreToolModes(t *testing.T) {
 			if err := os.WriteFile(log, nil, 0600); err != nil {
 				t.Fatal(err)
 			}
-			if err := a.Restore(t.Context(), []string{"2026-09-13T03:00:00"}); err != nil {
+			if err := a.Restore(t.Context(), []string{strings.TrimSuffix(filepath.Base(store.lastUploadedKey), a.Config.fileType())}); err != nil {
 				t.Fatal(err)
 			}
 			calls = readAppCommandLog(t, log)
@@ -251,11 +260,92 @@ func TestBackupAndRestoreToolModes(t *testing.T) {
 	}
 }
 
+func TestFixedBackupRequiresVerifiedVersioning(t *testing.T) {
+	for _, state := range []string{"disabled", "unavailable", "enabled"} {
+		t.Run(state, func(t *testing.T) {
+			a, store, source, log := newAppTest(t, "full")
+			a.Config.FilenameMode = "fixed"
+			store.versions = state == "enabled"
+			if state == "unavailable" {
+				store.versionErr = errors.New("AccessDenied")
+			}
+			key := a.Config.fixedKey("")
+			store.objects[key] = []byte("previous backup")
+			err := a.Backup(t.Context())
+			if state == "enabled" {
+				if err != nil || !store.allowOverwrite || bytes.Equal(store.objects[key], []byte("previous backup")) {
+					t.Fatalf("verified fixed backup failed: %v", err)
+				}
+				return
+			}
+			if err == nil || store.uploads != 0 || source.inspections != 0 || store.lists != 0 || readAppCommandLog(t, log) != "" || string(store.objects[key]) != "previous backup" {
+				t.Fatalf("unverified versioning allowed backup: err=%v uploads=%d", err, store.uploads)
+			}
+			if store.versionErr != nil && !errors.Is(err, store.versionErr) {
+				t.Fatalf("lost verification cause: %v", err)
+			}
+		})
+	}
+}
+
+func TestSameSecondGenerationsRemainIndependentlyRestorable(t *testing.T) {
+	a, store, _, log := newAppTest(t, "full")
+	var keys []string
+	for range 2 {
+		if err := a.Backup(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		keys = append(keys, store.lastUploadedKey)
+		if store.allowOverwrite {
+			t.Fatal("generation uploads permit overwriting")
+		}
+	}
+	if keys[0] == keys[1] || len(store.objects) != 2 {
+		t.Fatal("same-second backups collided")
+	}
+	for _, key := range keys {
+		generation := strings.TrimSuffix(filepath.Base(key), a.Config.fileType())
+		if err := a.Restore(t.Context(), []string{generation}); err != nil {
+			t.Fatal(err)
+		}
+		if store.downloadedKey != key {
+			t.Fatalf("wrong generation: %s", store.downloadedKey)
+		}
+	}
+	// Make the lexically smaller random ID newer in S3: random IDs must not
+	// determine latest-backup selection when LastModified distinguishes them.
+	sort.Strings(keys)
+	store.modified[keys[0]] = a.now().Add(time.Second)
+	if err := a.Restore(t.Context(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if store.downloadedKey != keys[0] {
+		t.Fatal("latest lookup sorted random IDs instead of LastModified")
+	}
+	store.modified[keys[1]] = store.modified[keys[0]]
+	if err := os.WriteFile(log, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Restore(t.Context(), nil); err == nil || !strings.Contains(err.Error(), "specify an explicit generation") {
+		t.Fatalf("indistinguishable generations were not rejected: %v", err)
+	}
+	if strings.Contains(readAppCommandLog(t, log), "mongorestore") {
+		t.Fatal("ambiguous selection started an import")
+	}
+	store.modified[keys[1]] = time.Time{}
+	if err := a.Restore(t.Context(), nil); err == nil {
+		t.Fatal("missing LastModified accepted")
+	}
+	if err := a.Restore(t.Context(), []string{"2026-09-13T03:00:00"}); err == nil {
+		t.Fatal("legacy timestamp argument accepted")
+	}
+}
+
 func TestRestoreDropReconnectsAfterAuth(t *testing.T) {
 	for _, mode := range []string{"full", "per-database"} {
 		for _, authFails := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/authFails=%t", mode, authFails), func(t *testing.T) {
-				a, _, _, log := newAppTest(t, mode)
+				a, store, _, log := newAppTest(t, mode)
 				if err := a.Backup(t.Context()); err != nil {
 					t.Fatal(err)
 				}
@@ -270,7 +360,7 @@ func TestRestoreDropReconnectsAfterAuth(t *testing.T) {
 				if mode == "per-database" {
 					restore = a.RestoreAuth
 				}
-				err := restore(t.Context(), []string{"2026-09-13T03:00:00"})
+				err := restore(t.Context(), []string{strings.TrimSuffix(filepath.Base(store.lastUploadedKey), a.Config.fileType())})
 				if (err != nil) != authFails {
 					t.Fatalf("restore error=%v, want failure=%t", err, authFails)
 				}
@@ -316,14 +406,14 @@ func TestRestoreDropReconnectsAfterAuth(t *testing.T) {
 
 func TestFailedBackupNeverPublishesOrRunsRetention(t *testing.T) {
 	for _, encrypted := range []bool{false, true} {
-		for _, failure := range []string{"data", "auth", "metadata", "config", "config-filename", "upload"} {
+		for _, failure := range []string{"data", "auth", "metadata", "clock", "config", "config-filename", "upload"} {
 			t.Run(fmt.Sprintf("%s/encrypted=%t", failure, encrypted), func(t *testing.T) {
 				a, store, source, _ := newAppTest(t, "per-database")
 				if encrypted {
 					a.Config.Passphrase = "unit gpg passphrase"
 				}
 				a.Config.KeepDays = "7"
-				oldKey := "unit/per-database/app/2026-08-01T00:00:00" + a.Config.fileType()
+				oldKey := "unit/per-database/app/2026-08-01T00:00:00-0123456789abcdef0123456789abcdef" + a.Config.fileType()
 				store.objects[oldKey] = []byte("previous successful backup")
 				store.modified[oldKey] = a.now().Add(-30 * 24 * time.Hour)
 				switch failure {
@@ -331,6 +421,16 @@ func TestFailedBackupNeverPublishesOrRunsRetention(t *testing.T) {
 					t.Setenv("TEST_DUMP_FAILURE", failure)
 				case "metadata":
 					source.failAfter = 2 // Data and authentication have already streamed.
+				case "clock":
+					start := a.now()
+					calls := 0
+					a.now = func() time.Time {
+						calls++
+						if calls >= 3 {
+							return start.Add(-time.Second)
+						}
+						return start
+					}
 				case "config":
 					a.Config.ConfigDir = filepath.Join(t.TempDir(), "missing")
 				case "config-filename":
@@ -346,6 +446,8 @@ func TestFailedBackupNeverPublishesOrRunsRetention(t *testing.T) {
 					t.Fatal("backup unexpectedly succeeded")
 				} else if failure == "config-filename" && !strings.Contains(err.Error(), "unsupported backup member name") {
 					t.Fatalf("unexpected filename error: %v", err)
+				} else if failure == "clock" && !strings.Contains(err.Error(), "system clock moved backwards") {
+					t.Fatalf("unexpected clock error: %v", err)
 				}
 				if ctx.Err() != nil {
 					t.Fatal("failed upload/producer did not promptly cancel its counterpart")
@@ -387,13 +489,14 @@ func TestUnicodeConfigurationFilenamesRoundTrip(t *testing.T) {
 func TestSuccessfulRetentionIsScopedToSelectedModeAndDatabase(t *testing.T) {
 	a, store, _, _ := newAppTest(t, "per-database")
 	a.Config.KeepDays = "7"
-	old := "unit/per-database/app/2026-08-01T00:00:00.zip"
+	old := "unit/per-database/app/2026-08-01T00:00:00-0123456789abcdef0123456789abcdef.zip"
 	for _, key := range []string{
 		old,
-		"unit/per-database/analytics/2026-08-01T00:00:00.zip",
-		"unit/full/2026-08-01T00:00:00.zip",
+		"unit/per-database/analytics/2026-08-01T00:00:00-0123456789abcdef0123456789abcdef.zip",
+		"unit/full/2026-08-01T00:00:00-0123456789abcdef0123456789abcdef.zip",
 		"unit/per-database/app/latest.zip",
 		"unit/per-database/app/unrelated.zip",
+		"unit/per-database/app/2026-08-01T00:00:00.zip", // Legacy generations are not managed.
 	} {
 		store.objects[key] = []byte("old object")
 		store.modified[key] = a.now().Add(-30 * 24 * time.Hour)
@@ -493,7 +596,7 @@ func TestRestoreFailureNeverStartsDatabaseImport(t *testing.T) {
 			if err := os.WriteFile(log, nil, 0600); err != nil {
 				t.Fatal(err)
 			}
-			key := a.Config.backupKey("app", a.now())
+			key := store.lastUploadedKey
 			switch failure {
 			case "download":
 				store.downloadErr = errors.New("download interrupted")
@@ -503,7 +606,9 @@ func TestRestoreFailureNeverStartsDatabaseImport(t *testing.T) {
 				store.objects[key] = alterAppTestBundle(t, store.objects[key], "config/mongod.conf")
 			case "mode":
 				a.Config.BackupMode, a.Config.Database = "full", ""
-				store.objects[a.Config.backupKey("", a.now())] = store.objects[key]
+				otherKey := a.Config.backupKey("", a.now())
+				store.objects[otherKey] = store.objects[key]
+				store.modified[otherKey] = a.now()
 			case "selection":
 				a.Config.Databases = []string{"app", "analytics"}
 			}
@@ -525,7 +630,7 @@ func TestGPGPipelineDescriptorsAndExtractConfiguration(t *testing.T) {
 	if err := a.Backup(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	key := a.Config.backupKey("app", a.now())
+	key := store.lastUploadedKey
 	if !strings.HasSuffix(key, ".zip.gpg") || len(store.objects[key]) == 0 {
 		t.Fatalf("encrypted pipeline did not publish the encrypted key: %q", key)
 	}
@@ -556,7 +661,7 @@ func TestGPGPipelineDescriptorsAndExtractConfiguration(t *testing.T) {
 func TestFailedEncryptionNeverPublishesOrRunsRetention(t *testing.T) {
 	a, store, _, _ := newAppTest(t, "per-database")
 	a.Config.Passphrase, a.Config.KeepDays = "unit gpg passphrase", "7"
-	oldKey := "unit/per-database/app/2026-08-01T00:00:00.zip.gpg"
+	oldKey := "unit/per-database/app/2026-08-01T00:00:00-0123456789abcdef0123456789abcdef.zip.gpg"
 	store.objects[oldKey] = []byte("previous encrypted backup")
 	store.modified[oldKey] = a.now().Add(-30 * 24 * time.Hour)
 	t.Setenv("TEST_GPG_FAILURE", "encrypt")

@@ -52,7 +52,7 @@ func TestStreamingUploadRejectsProducerFailure(t *testing.T) {
 			})
 			sourceErr := errors.New("mariadb-dump failed after emitting data")
 			body := io.NopCloser(failingStream{Reader: bytes.NewReader(make([]byte, size)), err: sourceErr})
-			if err := s.Upload(t.Context(), "latest.dump", body); !errors.Is(err, sourceErr) {
+			if err := s.Upload(t.Context(), "latest.dump", body, false); !errors.Is(err, sourceErr) {
 				t.Fatalf("producer failure was lost: %v", err)
 			}
 			if published.Load() || initiated.Load() != aborted.Load() || initiated.Load() != (size > 8*1024*1024) {
@@ -88,7 +88,7 @@ func TestStreamingUploadPartFailureInterruptsBlockedProducer(t *testing.T) {
 	}()
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	err := s.Upload(ctx, "latest.dump", reader)
+	err := s.Upload(ctx, "latest.dump", reader, false)
 	<-written
 	if err == nil || !strings.Contains(err.Error(), "AccessDenied") || ctx.Err() != nil || !aborted.Load() {
 		t.Fatalf("err=%v outer context=%v aborted=%v", err, ctx.Err(), aborted.Load())
@@ -101,7 +101,7 @@ func TestStreamingUploadCancellationInterruptsInitialRead(t *testing.T) {
 	defer writer.Close()
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
-	go func() { done <- s.Upload(ctx, "key", reader) }()
+	go func() { done <- s.Upload(ctx, "key", reader, false) }()
 	if _, err := writer.Write([]byte("partial")); err != nil {
 		t.Fatal(err)
 	}
@@ -160,12 +160,68 @@ func TestStreamingUploadRetriesBufferedPart(t *testing.T) {
 	})
 	// NopCloser hides Seek: retries must use the SDK's bounded part buffer.
 	body := io.NopCloser(bytes.NewReader(bytes.Repeat([]byte("data"), 3*1024*1024)))
-	if err := s.Upload(t.Context(), "key", body); err != nil {
+	if err := s.Upload(t.Context(), "key", body, false); err != nil {
 		t.Fatal(err)
 	}
 	mu.Lock()
 	defer mu.Unlock()
 	if attempts != 2 || !completed.Load() {
 		t.Fatalf("first part attempts=%d completed=%v", attempts, completed.Load())
+	}
+}
+
+func TestUploadConditionalPublication(t *testing.T) {
+	for _, multipart := range []bool{false, true} {
+		for _, overwrite := range []bool{false, true} {
+			for _, exists := range []bool{false, true} {
+				t.Run(fmt.Sprintf("multipart=%t/overwrite=%t/exists=%t", multipart, overwrite, exists), func(t *testing.T) {
+					var aborted, published, checked atomic.Bool
+					s := testS3(t, func(w http.ResponseWriter, r *http.Request) {
+						switch {
+						case r.Method == http.MethodPost && r.URL.Query().Has("uploads"):
+							writeXML(w, `<InitiateMultipartUploadResult><UploadId>conditional</UploadId></InitiateMultipartUploadResult>`)
+						case r.Method == http.MethodPut && r.URL.Query().Has("partNumber"):
+							io.Copy(io.Discard, r.Body)
+							w.Header().Set("ETag", `"part"`)
+						case r.Method == http.MethodDelete:
+							aborted.Store(true)
+							w.WriteHeader(http.StatusNoContent)
+						case r.Method == http.MethodPut || r.Method == http.MethodPost:
+							io.Copy(io.Discard, r.Body)
+							checked.Store(true)
+							want := "*"
+							if overwrite {
+								want = ""
+							}
+							if got := r.Header.Get("If-None-Match"); got != want {
+								t.Errorf("If-None-Match=%q, want %q", got, want)
+							}
+							if exists && r.Header.Get("If-None-Match") == "*" {
+								writeS3Error(w, http.StatusPreconditionFailed, "PreconditionFailed")
+								return
+							}
+							published.Store(true)
+							if multipart {
+								writeXML(w, `<CompleteMultipartUploadResult><ETag>"complete"</ETag></CompleteMultipartUploadResult>`)
+							}
+						default:
+							t.Errorf("unexpected request: %s %s", r.Method, r.URL)
+						}
+					})
+					size := 100
+					if multipart {
+						size = 12 * 1024 * 1024
+					}
+					err := s.Upload(t.Context(), "key", io.NopCloser(bytes.NewReader(make([]byte, size))), overwrite)
+					conflict := exists && !overwrite
+					if (err != nil) != conflict || !checked.Load() || published.Load() == conflict || aborted.Load() != (multipart && conflict) {
+						t.Fatalf("err=%v checked=%v published=%v aborted=%v", err, checked.Load(), published.Load(), aborted.Load())
+					}
+					if conflict && !strings.Contains(err.Error(), "PreconditionFailed") {
+						t.Fatalf("lost conflict cause: %v", err)
+					}
+				})
+			}
+		}
 	}
 }

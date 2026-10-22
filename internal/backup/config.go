@@ -1,6 +1,7 @@
 package backup
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -16,8 +17,15 @@ import (
 
 const timestampLayout = "2006-01-02T15:04:05"
 
-var timestampPattern = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}$`)
-var backupSuffixPattern = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.zip(\.gpg)?$`)
+var generationPattern = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}-[0-9a-f]{32}$`)
+
+func validGeneration(name string) bool {
+	if !generationPattern.MatchString(name) {
+		return false
+	}
+	_, err := time.Parse(timestampLayout, name[:len(timestampLayout)])
+	return err == nil
+}
 
 type Config struct {
 	URI, TLSCA, ReadPreference, ConfigDir                string
@@ -296,9 +304,15 @@ func (c Config) backupKey(database string, now time.Time) string {
 	if c.FilenameMode == "fixed" {
 		return c.fixedKey(database)
 	}
-	return c.timestampPrefix(database) + now.UTC().Format(timestampLayout) + c.fileType()
+	var id [16]byte
+	rand.Read(id[:]) // crypto/rand.Read always fills the buffer or terminates the process.
+	return c.timestampPrefix(database) + now.UTC().Format(timestampLayout) + fmt.Sprintf("-%x", id) + c.fileType()
 }
 func (c Config) isTimestampBackup(database, key string) bool {
 	prefix := c.timestampPrefix(database)
-	return strings.HasPrefix(key, prefix) && backupSuffixPattern.MatchString(strings.TrimPrefix(key, prefix))
+	if !strings.HasPrefix(key, prefix) {
+		return false
+	}
+	name := strings.TrimSuffix(strings.TrimPrefix(key, prefix), ".gpg")
+	return strings.HasSuffix(name, ".zip") && validGeneration(strings.TrimSuffix(name, ".zip"))
 }

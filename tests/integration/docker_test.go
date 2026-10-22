@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ajctrl/mongodb-backup-s3/internal/storage"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -52,6 +53,32 @@ func TestBackupRestore(t *testing.T) {
 	f := newFixture(t, ctx)
 	source := f.connect(t, f.sourceURI)
 	f.seed(t, source)
+
+	t.Run("conditional_writes_preserve_existing_generation", func(t *testing.T) {
+		store, err := storage.New(ctx, storage.Config{Bucket: f.bucket, Region: "us-east-1", Endpoint: f.endpoint,
+			AccessKeyID: "integration", SecretAccessKey: testPassword, UploadPartSizeBytes: 5 * 1024 * 1024})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, size := range []int{100, 6 * 1024 * 1024} {
+			key := fmt.Sprintf("conditional/%d", size)
+			if err := store.Upload(ctx, key, io.NopCloser(strings.NewReader("original")), false); err != nil {
+				t.Fatal(err)
+			}
+			before := f.version(t, key)
+			err := store.Upload(ctx, key, io.NopCloser(bytes.NewReader(make([]byte, size))), false)
+			if err == nil || !strings.Contains(err.Error(), "PreconditionFailed") {
+				t.Fatalf("overwrite was not rejected: %v", err)
+			}
+			if f.version(t, key) != before {
+				t.Fatal("rejected upload replaced existing generation")
+			}
+			pending, err := f.s3.ListMultipartUploads(ctx, &s3.ListMultipartUploadsInput{Bucket: aws.String(f.bucket), Prefix: aws.String(key)})
+			if err != nil || len(pending.Uploads) != 0 {
+				t.Fatalf("rejected upload not cleaned up: %+v %v", pending, err)
+			}
+		}
+	})
 
 	if !t.Run("full_oplog_concurrent_writes_and_auth", func(t *testing.T) {
 		var completed atomic.Int64
@@ -113,8 +140,8 @@ func TestBackupRestore(t *testing.T) {
 		f.assertBundle(t, keys[0], false)
 		env["MONGODB_URI"] = f.targetURI
 		env["MONGODB_RESTORE_DROP"] = "true"
-		timestamp := strings.TrimSuffix(filepath.Base(keys[0]), ".zip")
-		f.run(t, env, "restore", timestamp)
+		generation := strings.TrimSuffix(filepath.Base(keys[0]), ".zip")
+		f.run(t, env, "restore", generation)
 		// The restore replaces the destination root user's identity as well as
 		// its credentials. Verify through a newly authenticated connection.
 		target := f.connect(t, f.targetURI)

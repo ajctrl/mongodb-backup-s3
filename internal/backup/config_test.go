@@ -159,7 +159,7 @@ func TestModeScopeAndRetentionMatching(t *testing.T) {
 	full := Config{BackupMode: "full", Prefix: "backups/", FilenameMode: "timestamp"}
 	db := full
 	db.BackupMode = "per-database"
-	if full.backupKey("", stamp) != "backups/full/2026-09-13T03:00:00.zip" || db.backupKey("a%b", stamp) != "backups/per-database/a%25b/2026-09-13T03:00:00.zip" {
+	if !strings.HasPrefix(full.backupKey("", stamp), "backups/full/2026-09-13T03:00:00-") || !strings.HasPrefix(db.backupKey("a%b", stamp), "backups/per-database/a%25b/2026-09-13T03:00:00-") {
 		t.Fatal("incorrect scoped layout")
 	}
 	for _, key := range []string{db.backupKey("app", stamp), full.fixedKey(""), "backups/full/sub/2026-09-13T03:00:00.zip", "backups/full/notes.zip", "backups/full/2026-09-13T03:00:00.zip.bak"} {
@@ -169,5 +169,17 @@ func TestModeScopeAndRetentionMatching(t *testing.T) {
 	}
 	if !full.isTimestampBackup("", full.backupKey("", stamp)) {
 		t.Fatal("timestamp not matched")
+	}
+}
+
+func TestGenerationValidation(t *testing.T) {
+	const id = "-0123456789abcdef0123456789abcdef"
+	for _, name := range []string{"2026-02-30T03:00:00" + id, "2026-09-13T25:00:00" + id, "2026-09-13T03:00:00", "2026-09-13T03:00:00" + id + ".zip", "../2026-09-13T03:00:00" + id} {
+		if validGeneration(name) {
+			t.Fatalf("invalid generation accepted: %q", name)
+		}
+	}
+	if !validGeneration("2026-09-13T03:00:00" + id) {
+		t.Fatal("valid generation rejected")
 	}
 }

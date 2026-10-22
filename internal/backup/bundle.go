@@ -107,6 +107,9 @@ func (a *App) writeBundle(ctx context.Context, out io.Writer, r commandRunner, s
 		return fmt.Errorf("replica set configuration or server version changed during backup")
 	}
 	m.CompletedAt = a.now().UTC()
+	if err := m.validateMetadata(); err != nil {
+		return err
+	}
 	manifest, err := json.Marshal(m)
 	if err != nil {
 		return err
@@ -125,6 +128,16 @@ func (a *App) writeBundle(ctx context.Context, out io.Writer, r commandRunner, s
 		return err
 	}
 	return z.Close()
+}
+
+func (m Manifest) validateMetadata() error {
+	if m.ServerVersion == "" || m.ToolsVersion == "" || m.FCV == "" || m.StartedAt.IsZero() || m.CompletedAt.IsZero() {
+		return fmt.Errorf("incomplete backup manifest")
+	}
+	if m.CompletedAt.Before(m.StartedAt) {
+		return fmt.Errorf("backup completion precedes start; system clock moved backwards")
+	}
+	return nil
 }
 
 func safeMember(name string) bool {
@@ -171,8 +184,8 @@ func validateBundle(ctx context.Context, z *zip.ReadCloser, c Config) (Manifest,
 	if m.FormatVersion != 1 || m.Mode != c.BackupMode || m.Oplog != (m.Mode == "full") || m.Database != c.Database {
 		return m, fmt.Errorf("backup manifest does not match selected mode/database")
 	}
-	if m.ServerVersion == "" || m.ToolsVersion == "" || m.FCV == "" || m.StartedAt.IsZero() || m.CompletedAt.Before(m.StartedAt) {
-		return m, fmt.Errorf("incomplete backup manifest")
+	if err := m.validateMetadata(); err != nil {
+		return m, err
 	}
 	if files["data.archive.gz"] == nil || files["replica-set.json"] == nil || (m.Mode == "per-database" && files["auth.archive.gz"] == nil) {
 		return m, fmt.Errorf("backup is missing required components")

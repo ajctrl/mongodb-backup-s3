@@ -29,10 +29,7 @@ func (a *App) validateRestore(args []string) (string, string, error) {
 	case 0:
 		return "", "", nil
 	case 1:
-		if c.FilenameMode != "timestamp" || !timestampPattern.MatchString(args[0]) {
-			break
-		}
-		if _, err := time.Parse(timestampLayout, args[0]); err != nil {
+		if c.FilenameMode != "timestamp" || !validGeneration(args[0]) {
 			break
 		}
 		return args[0], "", nil
@@ -41,7 +38,7 @@ func (a *App) validateRestore(args []string) (string, string, error) {
 			return "", args[1], nil
 		}
 	}
-	return "", "", fmt.Errorf("use [timestamp] in timestamp mode or [--version-id ID] in fixed mode")
+	return "", "", fmt.Errorf("use [generation] in timestamp mode or [--version-id ID] in fixed mode")
 }
 func (a *App) Restore(ctx context.Context, args []string) error { return a.restore(ctx, args, false) }
 func (a *App) RestoreAuth(ctx context.Context, args []string) error {
@@ -139,58 +136,105 @@ func (a *App) ExtractConfig(ctx context.Context, dest string, args []string) err
 }
 
 func (a *App) withBundle(ctx context.Context, args []string, r commandRunner, action func(*zip.ReadCloser, Manifest, string) error) error {
-	timestamp, version, err := a.validateRestore(args)
+	generation, version, err := a.validateRestore(args)
 	if err != nil {
 		return err
 	}
-	key := ""
+	var keys []string
 	c := a.Config
 	if c.FilenameMode == "fixed" {
-		key = c.fixedKey(c.Database)
-	} else if timestamp != "" {
-		key = c.timestampPrefix(c.Database) + timestamp + c.fileType()
+		keys = []string{c.fixedKey(c.Database)}
+	} else if generation != "" {
+		keys = []string{c.timestampPrefix(c.Database) + generation + c.fileType()}
 	} else {
 		objects, err := a.timestampBackups(ctx, c.Database)
 		if err != nil {
 			return err
 		}
+		var newest time.Time
 		for _, obj := range objects {
-			if strings.HasSuffix(obj.Key, c.fileType()) && obj.Key > key {
-				key = obj.Key
+			if !strings.HasSuffix(obj.Key, c.fileType()) {
+				continue
+			}
+			if obj.LastModified.IsZero() {
+				return fmt.Errorf("missing LastModified for backup %q", obj.Key)
+			}
+			if obj.LastModified.After(newest) {
+				keys = []string{obj.Key}
+				newest = obj.LastModified
+			} else if obj.LastModified.Equal(newest) {
+				keys = append(keys, obj.Key)
 			}
 		}
-		if key == "" {
+		if len(keys) == 0 {
 			return fmt.Errorf("no matching backup found")
 		}
 	}
 	return withWorkspace(func(dir string) error {
-		file := filepath.Join(dir, "backup"+c.fileType())
-		fmt.Fprintln(a.Out, "Downloading backup...")
-		if err := a.Store.Download(ctx, key, version, file); err != nil {
-			return err
-		}
-		if c.Passphrase != "" {
-			plain := filepath.Join(dir, "backup.zip")
-			w, err := os.OpenFile(plain, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		var selectedDir string
+		var selected Manifest
+		ambiguous := false
+		// Only tied S3 timestamps require extra downloads. Keep at most the
+		// current winner and one candidate on disk, and validate all candidates
+		// before any import. Never fall back past an unreadable candidate.
+		for _, key := range keys {
+			candidateDir, err := os.MkdirTemp(dir, "candidate-")
 			if err != nil {
 				return err
 			}
-			err = r.run(ctx, w, "gpg", "--decrypt", "--batch", "--pinentry-mode", "loopback", file)
-			err = errors.Join(err, w.Close())
+			m, err := a.downloadBundle(ctx, key, version, candidateDir, r)
 			if err != nil {
-				return err
+				return fmt.Errorf("validate backup %q: %w", key, err)
 			}
-			file = plain
+			discard := candidateDir
+			if selectedDir == "" || m.CompletedAt.After(selected.CompletedAt) {
+				discard = selectedDir
+				selectedDir, selected = candidateDir, m
+				ambiguous = false
+			} else if m.CompletedAt.Equal(selected.CompletedAt) {
+				ambiguous = true
+			}
+			if discard != "" {
+				if err := os.RemoveAll(discard); err != nil {
+					return err
+				}
+			}
 		}
-		z, err := zip.OpenReader(file)
+		if ambiguous {
+			return fmt.Errorf("latest backup is ambiguous: S3 LastModified and manifest completed_at are identical; specify an explicit generation")
+		}
+		z, err := zip.OpenReader(filepath.Join(selectedDir, "backup.zip"))
 		if err != nil {
-			return fmt.Errorf("open backup bundle: %w", err)
+			return err
 		}
 		defer z.Close()
-		m, err := validateBundle(ctx, z, c)
-		if err != nil {
-			return err
-		}
-		return action(z, m, dir)
+		return action(z, selected, selectedDir)
 	})
+}
+
+func (a *App) downloadBundle(ctx context.Context, key, version, dir string, r commandRunner) (Manifest, error) {
+	file := filepath.Join(dir, "backup"+a.Config.fileType())
+	fmt.Fprintf(a.Out, "Downloading backup: %s\n", key)
+	if err := a.Store.Download(ctx, key, version, file); err != nil {
+		return Manifest{}, err
+	}
+	if a.Config.Passphrase != "" {
+		plain := filepath.Join(dir, "backup.zip")
+		w, err := os.OpenFile(plain, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		if err != nil {
+			return Manifest{}, err
+		}
+		err = r.run(ctx, w, "gpg", "--decrypt", "--batch", "--pinentry-mode", "loopback", file)
+		err = errors.Join(err, w.Close())
+		if err != nil {
+			return Manifest{}, err
+		}
+		file = plain
+	}
+	z, err := zip.OpenReader(file)
+	if err != nil {
+		return Manifest{}, fmt.Errorf("open backup bundle: %w", err)
+	}
+	m, err := validateBundle(ctx, z, a.Config)
+	return m, errors.Join(err, z.Close())
 }

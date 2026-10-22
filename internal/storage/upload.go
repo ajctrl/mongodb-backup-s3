@@ -14,7 +14,7 @@ import (
 
 // Upload consumes and closes body. The producer must return EOF only after all
 // processing succeeds; a read error aborts the upload without publishing a key.
-func (s *S3) Upload(ctx context.Context, key string, body io.ReadCloser) error {
+func (s *S3) Upload(ctx context.Context, key string, body io.ReadCloser, allowOverwrite bool) error {
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	var closeOnce sync.Once
@@ -27,8 +27,14 @@ func (s *S3) Upload(ctx context.Context, key string, body io.ReadCloser) error {
 	stop := context.AfterFunc(ctx, closeBody)
 	defer stop()
 	client := &streamUploadClient{Client: s.client, cancel: cancel}
+	var ifNoneMatch *string
+	if !allowOverwrite {
+		// Applies to PutObject and CompleteMultipartUpload, so even concurrent
+		// writers cannot replace an existing generation.
+		ifNoneMatch = aws.String("*")
+	}
 	_, err := s.transfer.UploadObject(ctx, &transfermanager.UploadObjectInput{
-		Bucket: aws.String(s.bucket), Key: aws.String(key), Body: body,
+		Bucket: aws.String(s.bucket), Key: aws.String(key), Body: body, IfNoneMatch: ifNoneMatch,
 	}, func(o *transfermanager.Options) {
 		o.S3 = client
 		o.PartSizeBytes = s.uploadPartSize

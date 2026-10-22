@@ -110,7 +110,7 @@ func (a *App) Backup(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			fmt.Fprintf(a.Err, "Warning: Could not verify S3 bucket versioning: %v. Continuing; without versioning fixed backups overwrite previous backups.\n", err)
+			return fmt.Errorf("could not verify S3 bucket versioning; fixed backup refused: %w", err)
 		} else if !enabled {
 			return fmt.Errorf("fixed filenames require S3 bucket versioning to be Enabled")
 		}
@@ -124,7 +124,6 @@ func (a *App) Backup(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	cutoff := a.now().UTC().Truncate(time.Second).Add(-time.Duration(days) * 24 * time.Hour)
 	return a.withRunner(lock, func(r commandRunner) error {
 		var version bytes.Buffer
 		if err := r.run(ctx, &version, "mongodump", "--version"); err != nil {
@@ -139,9 +138,11 @@ func (a *App) Backup(ctx context.Context) error {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
+			started := a.now().UTC()
+			var key string
 			snapshot, err := source.Inspect(ctx)
 			if err == nil {
-				err = a.backupDatabase(ctx, r, source, db, snapshot, toolsVersion)
+				key, err = a.backupDatabase(ctx, r, source, db, snapshot, toolsVersion)
 			}
 			if err != nil {
 				fmt.Fprintf(a.Err, "Backup failed (%s): %v\n", a.label(db), err)
@@ -150,7 +151,7 @@ func (a *App) Backup(ctx context.Context) error {
 			}
 			fmt.Fprintf(a.Out, "Backup complete: %s\n", a.label(db))
 			if days > 0 {
-				if err := a.removeOldBackups(ctx, db, cutoff); err != nil {
+				if err := a.removeOldBackups(ctx, db, key, started, a.now().UTC(), days); err != nil {
 					failures = append(failures, err)
 					fmt.Fprintf(a.Err, "Retention failed (%s): %v\n", a.label(db), err)
 				}
@@ -240,10 +241,10 @@ func (a *App) dumpArgs(db string, auth bool) []string {
 	return append(args, "--db="+db)
 }
 
-func (a *App) backupDatabase(ctx context.Context, r commandRunner, source Source, db string, snapshot Snapshot, toolsVersion string) error {
+func (a *App) backupDatabase(ctx context.Context, r commandRunner, source Source, db string, snapshot Snapshot, toolsVersion string) (string, error) {
 	now := a.now().UTC()
 	key := a.Config.backupKey(db, now)
-	fmt.Fprintf(a.Out, "Creating and uploading backup: %s\n", a.label(db))
+	fmt.Fprintf(a.Out, "Creating and uploading backup: %s (key: %s)\n", a.label(db), key)
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	reader, writer := io.Pipe()
@@ -259,12 +260,12 @@ func (a *App) backupDatabase(ctx context.Context, r commandRunner, source Source
 		writer.CloseWithError(err)
 		done <- err
 	}()
-	err := a.Store.Upload(ctx, key, reader)
+	err := a.Store.Upload(ctx, key, reader, a.Config.FilenameMode == "fixed")
 	if err != nil {
 		cancel()
 		reader.CloseWithError(err)
 	}
-	return errors.Join(err, <-done)
+	return key, errors.Join(err, <-done)
 }
 
 // A producer failure is propagated as a read error, never as successful EOF.
@@ -316,19 +317,53 @@ func (a *App) timestampBackups(ctx context.Context, db string) ([]storage.Object
 	}
 	return backups, nil
 }
-func (a *App) removeOldBackups(ctx context.Context, db string, cutoff time.Time) error {
-	objects, err := a.timestampBackups(ctx, db)
+
+// S3 may timestamp multipart objects at initiation rather than completion.
+// Compare its timestamp with the entire capture/upload interval, allowing for
+// timestamp precision and small clock differences, before deleting anything.
+const retentionClockTolerance = 5 * time.Minute
+
+func (a *App) removeOldBackups(ctx context.Context, db, publishedKey string, started, completed time.Time, days int) error {
+	objects, err := a.Store.List(ctx, a.Config.timestampPrefix(db))
 	if err != nil {
 		return err
 	}
+	var published, newest time.Time
+	var backups []storage.Object
 	for _, obj := range objects {
+		managed := a.Config.isTimestampBackup(db, obj.Key)
+		if !managed && obj.Key != publishedKey {
+			continue
+		}
 		if obj.LastModified.IsZero() {
 			return fmt.Errorf("missing modification time for %q", obj.Key)
 		}
+		if obj.Key == publishedKey {
+			published = obj.LastModified
+		}
+		if managed {
+			backups = append(backups, obj)
+			if obj.LastModified.After(newest) {
+				newest = obj.LastModified
+			}
+		}
 	}
-	for _, obj := range objects {
+	if published.IsZero() {
+		return fmt.Errorf("retention refused: newly published backup %q is missing from S3 listing", publishedKey)
+	}
+	if completed.Before(started) || published.Before(started.Add(-retentionClockTolerance)) || published.After(completed.Add(retentionClockTolerance)) {
+		return fmt.Errorf("retention refused: S3 timestamp %s is outside the backup interval %s to %s (clock tolerance %s); backup saved, no objects deleted", published.Format(time.RFC3339Nano), started.Format(time.RFC3339Nano), completed.Format(time.RFC3339Nano), retentionClockTolerance)
+	}
+	// Use the new object's S3 timestamp, not the host clock, as the age reference.
+	cutoff := published.Add(-time.Duration(days) * 24 * time.Hour)
+	for _, obj := range backups {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		// Preserve the published generation and all ties for newest. This also
+		// leaves at least one timestamp generation when publishing a fixed key.
+		if obj.Key == publishedKey || obj.LastModified.Equal(newest) {
+			continue
 		}
 		if obj.LastModified.Before(cutoff) {
 			if err := a.Store.Delete(ctx, obj.Key); err != nil {

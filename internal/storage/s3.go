@@ -26,7 +26,7 @@ type Object struct {
 
 type Store interface {
 	VersioningEnabled(context.Context) (bool, error)
-	Upload(ctx context.Context, key string, body io.ReadCloser) error
+	Upload(ctx context.Context, key string, body io.ReadCloser, allowOverwrite bool) error
 	Download(ctx context.Context, key, versionID, path string) error
 	List(ctx context.Context, prefix string) ([]Object, error)
 	Delete(ctx context.Context, key string) error

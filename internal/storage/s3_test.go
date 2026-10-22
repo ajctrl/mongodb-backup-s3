@@ -124,7 +124,7 @@ func TestS3SignedRequestsAndFileRoundTrip(t *testing.T) {
 	if err := os.WriteFile(path, payload, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Upload(ctx, key, openUpload(t, path)); err != nil {
+	if err := s.Upload(ctx, key, openUpload(t, path), false); err != nil {
 		t.Fatal(err)
 	}
 	if uploaded.Load() == nil || !bytes.Equal(uploaded.Load().([]byte), payload) {
@@ -262,7 +262,7 @@ func TestS3MultipartUpload(t *testing.T) {
 	if err := os.WriteFile(path, payload, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Upload(context.Background(), "large.dump", openUpload(t, path)); err != nil {
+	if err := s.Upload(context.Background(), "large.dump", openUpload(t, path), false); err != nil {
 		t.Fatal(err)
 	}
 	mu.Lock()
@@ -304,7 +304,7 @@ func TestS3CanceledMultipartUploadIsAborted(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.Close()
-	if err := s.Upload(ctx, "large.dump", openUpload(t, path)); err == nil {
+	if err := s.Upload(ctx, "large.dump", openUpload(t, path), false); err == nil {
 		t.Fatal("canceled upload succeeded")
 	}
 	if !aborted.Load() {
@@ -429,7 +429,7 @@ func TestS3DisabledVersioningAndCancellation(t *testing.T) {
 	cancel()
 	for name, operation := range map[string]func() error{
 		"versioning": func() error { _, err := s.VersioningEnabled(ctx); return err },
-		"upload":     func() error { return s.Upload(ctx, "key", io.NopCloser(strings.NewReader("unused"))) },
+		"upload":     func() error { return s.Upload(ctx, "key", io.NopCloser(strings.NewReader("unused")), false) },
 		"download":   func() error { return s.Download(ctx, "key", "", "missing") },
 		"list":       func() error { _, err := s.List(ctx, ""); return err },
 		"delete":     func() error { return s.Delete(ctx, "key") },
