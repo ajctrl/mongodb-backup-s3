@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -339,9 +340,21 @@ type fixture struct {
 	s3                               *s3.Client
 	baseEnv                          map[string]string
 	runNumber                        int
+	tlsConfig                        *tls.Config
+	secondaryPort                    string
 }
 
 func newFixture(t *testing.T, ctx context.Context) *fixture {
+	t.Helper()
+	return newFixtureWithOptions(t, ctx, fixtureOptions{})
+}
+
+type fixtureOptions struct {
+	tls       bool
+	secondary bool
+}
+
+func newFixtureWithOptions(t *testing.T, ctx context.Context, opts fixtureOptions) *fixture {
 	t.Helper()
 	f := &fixture{ctx: ctx, native: os.Getenv("MONGODB_NATIVE_INTEGRATION") == "1", name: fmt.Sprintf("mongos3-integration-%d", time.Now().UnixNano())}
 	f.configDir, f.outputDir = t.TempDir(), t.TempDir()
@@ -355,6 +368,14 @@ func newFixture(t *testing.T, ctx context.Context) *fixture {
 	f.endpoint = "http://127.0.0.1:" + s3Port
 	f.sourceURI = authenticatedURI(sourcePort, "source")
 	f.targetURI = authenticatedURI(targetPort, "destination")
+	if opts.tls {
+		f.tlsConfig = createTestCertificates(t, f.configDir)
+		f.sourceURI += "&tls=true"
+		f.targetURI += "&tls=true"
+	}
+	if opts.secondary {
+		f.secondaryPort = unusedPort(t)
+	}
 	if f.native {
 		f.binary = requireBinary(t, "BACKUP_TEST_BINARY", "mongodb-backup-s3")
 		mongod := requireBinary(t, "MONGOD_TEST_BINARY", "mongod")
@@ -369,8 +390,9 @@ func newFixture(t *testing.T, ctx context.Context) *fixture {
 			if err := os.Chmod(key, 0600); err != nil {
 				t.Fatal(err)
 			}
-			startProcess(t, mongod, nil, "--dbpath", dir, "--bind_ip", "127.0.0.1", "--port", server.port,
-				"--replSet", server.set, "--keyFile", key, "--oplogSize", "128", "--setParameter", "enableTestCommands=1")
+			args := []string{"--dbpath", dir, "--bind_ip", "127.0.0.1", "--port", server.port,
+				"--replSet", server.set, "--keyFile", key, "--oplogSize", "128", "--setParameter", "enableTestCommands=1"}
+			startProcess(t, mongod, nil, append(args, f.mongoTLSArgs(f.configDir)...)...)
 		}
 		startProcess(t, silo, []string{"MINIO_ROOT_USER=integration", "MINIO_ROOT_PASSWORD=" + testPassword},
 			"server", "--address", "127.0.0.1:"+s3Port, "--console-address", "127.0.0.1:"+unusedPort(t), t.TempDir())
@@ -388,15 +410,22 @@ func newFixture(t *testing.T, ctx context.Context) *fixture {
 		startMongo := func(name, port, set string, networkArgs []string) {
 			args := append([]string{"run", "-d", "--name", name}, networkArgs...)
 			args = append(args, "-e", "MONGO_INITDB_ROOT_USERNAME=root", "-e", "MONGO_INITDB_ROOT_PASSWORD="+testPassword)
+			if f.tlsConfig != nil {
+				args = append(args, "--mount", "type=bind,source="+f.configDir+",target=/test-tls,readonly")
+			}
 			args = append(args, "--entrypoint", "bash", mongoImage, "-c",
-				"printf '%s' "+testReplicaKey+" >/tmp/test-key; chmod 600 /tmp/test-key; chown mongodb:mongodb /tmp/test-key; exec docker-entrypoint.sh mongod --bind_ip_all --port "+port+" --replSet "+set+" --keyFile /tmp/test-key --oplogSize 128 --setParameter enableTestCommands=1")
+				"set -eu; printf '%s' "+testReplicaKey+" >/tmp/test-key; chmod 600 /tmp/test-key; chown mongodb:mongodb /tmp/test-key; "+f.copyTLSCommand()+"exec docker-entrypoint.sh mongod --bind_ip_all --port "+port+" --replSet "+set+" --keyFile /tmp/test-key --oplogSize 128 --setParameter enableTestCommands=1 "+strings.Join(f.mongoTLSArgs("/tmp"), " "))
 			docker(t, ctx, args...)
 		}
-		startMongo(f.anchor, sourcePort, "source", []string{
+		networkArgs := []string{
 			"-p", "127.0.0.1:" + sourcePort + ":" + sourcePort,
 			"-p", "127.0.0.1:" + targetPort + ":" + targetPort,
 			"-p", "127.0.0.1:" + s3Port + ":" + s3Port,
-		})
+		}
+		if f.secondaryPort != "" {
+			networkArgs = append(networkArgs, "-p", "127.0.0.1:"+f.secondaryPort+":"+f.secondaryPort)
+		}
+		startMongo(f.anchor, sourcePort, "source", networkArgs)
 		// The official entrypoint temporarily uses port 27017 for initialization.
 		// Finish the source first because the destination shares its namespace.
 		f.initializeReplica(t, sourcePort, "source")
@@ -460,6 +489,12 @@ func newFixture(t *testing.T, ctx context.Context) *fixture {
 		"SCHEDULE": "", "PASSPHRASE": "", "BACKUP_KEEP_DAYS": "", "MONGODB_URI_FILE": "",
 		"MONGODB_DATABASE": "", "MONGODB_DATABASES": "", "MONGODB_BACKUP_ALL": "false", "MONGODB_DATABASES_EXCLUDE": "",
 	}
+	if f.tlsConfig != nil {
+		f.baseEnv["MONGODB_TLS_CA_FILE"] = filepath.Join(configPath, "ca.pem")
+	}
+	if f.secondaryPort != "" {
+		f.addSecondary(t)
+	}
 	return f
 }
 
@@ -508,7 +543,11 @@ func (f *fixture) connect(t *testing.T, uri string) *mongo.Client {
 	t.Helper()
 	// Direct mode allows the Go fixture to work through Docker published ports.
 	// The backup process itself uses replica-set discovery in its shared network.
-	client, err := mongo.Connect(options.Client().ApplyURI(uri).SetDirect(true).SetServerSelectionTimeout(3 * time.Second))
+	opts := options.Client().ApplyURI(uri).SetDirect(true).SetServerSelectionTimeout(3 * time.Second)
+	if f.tlsConfig != nil {
+		opts.SetTLSConfig(f.tlsConfig.Clone())
+	}
+	client, err := mongo.Connect(opts)
 	if err != nil {
 		t.Fatal(err)
 	}
