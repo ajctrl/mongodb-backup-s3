@@ -413,6 +413,8 @@ go test -count=1 -tags=integration -v -timeout=20m ./tests/integration
 ```
 
 Integration tests start disposable MongoDB replica set and Silo containers.
+CI runs the final image's runtime checks and backup/restore integration suite on native amd64 and arm64
+runners. Both architectures must pass before the publishing job runs.
 Backup commands use a dedicated account with only `backup` and `clusterMonitor` roles;
 fixture setup and restores use a separate administrator. Tests also verify that insufficient privileges
 prevent publication and that conditional writes preserve existing generations.
