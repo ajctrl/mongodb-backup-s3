@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"strings"
 	"syscall"
-	"time"
 )
 
 type commandRunner struct {
@@ -67,7 +66,6 @@ func (r commandRunner) command(ctx context.Context, name string, args ...string)
 		}
 		return err
 	}
-	cmd.WaitDelay = 5 * time.Second
 	return cmd, closeFiles, nil
 }
 
@@ -80,81 +78,6 @@ func commandError(ctx context.Context, name string, err error) error {
 		return fmt.Errorf("%s failed: %w", name, err)
 	}
 	return nil
-}
-
-type pipelineCommand struct {
-	name string
-	args []string
-}
-
-// pipeline waits for every process, including a producer that closes stdout
-// before reporting an error. Only its caller may signal EOF to the uploader.
-func (r commandRunner) pipeline(ctx context.Context, stdout io.Writer, specs ...pipelineCommand) error {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	cmds := make([]*exec.Cmd, len(specs))
-	var pipes []*os.File
-	closePipes := func() {
-		for _, pipe := range pipes {
-			pipe.Close()
-		}
-		pipes = nil
-	}
-	defer closePipes()
-	for i, spec := range specs {
-		cmd, closeFiles, err := r.command(ctx, spec.name, spec.args...)
-		if err != nil {
-			return err
-		}
-		defer closeFiles()
-		cmds[i] = cmd
-		// A slow upload may still be draining stdout after the child exits.
-		// Cancellation closes the upload pipe; do not truncate it after WaitDelay.
-		cmds[i].WaitDelay = 0
-		if i > 0 {
-			reader, writer, err := os.Pipe()
-			if err != nil {
-				return err
-			}
-			pipes = append(pipes, reader, writer)
-			cmds[i-1].Stdout, cmds[i].Stdin = writer, reader
-		}
-	}
-	cmds[len(cmds)-1].Stdout = stdout
-	var started []int
-	var result error
-	// Start consumers first; OS pipes give backpressure without buffering dumps.
-	for i := len(cmds) - 1; i >= 0; i-- {
-		if err := cmds[i].Start(); err != nil {
-			result = commandError(ctx, specs[i].name, err)
-			cancel()
-			break
-		}
-		started = append(started, i)
-	}
-	// Only children retain these descriptors, so early exits propagate EOF/EPIPE.
-	closePipes()
-	done := make(chan error, len(started))
-	for _, i := range started {
-		go func() { done <- commandError(ctx, specs[i].name, cmds[i].Wait()) }()
-	}
-	for range started {
-		if err := <-done; err != nil {
-			result = errors.Join(result, err)
-			cancel()
-		}
-	}
-	return result
-}
-
-func withoutEnv(environ []string, name string) []string {
-	result := make([]string, 0, len(environ))
-	for _, entry := range environ {
-		if !strings.HasPrefix(entry, name+"=") {
-			result = append(result, entry)
-		}
-	}
-	return result
 }
 
 func childEnvironment() []string {
