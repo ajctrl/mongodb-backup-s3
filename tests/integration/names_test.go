@@ -16,7 +16,7 @@ func TestLinuxDatabaseNames(t *testing.T) {
 	defer cancel()
 	f := newFixture(t, ctx)
 	source, target := f.connect(t, f.sourceURI), f.connect(t, f.targetURI)
-	names := []string{"app", "legacy:db", "star*db", "angle<db>", "pipe|db", "question?db", "private", "archive", "selected,db"}
+	names := []string{"app", "legacy:db", "star*db", "angle<db>", "pipe|db", "question?db", "private", "archive", "selected,db", "line\nbreak", "tab\tdb", "escape\x1b[31mdb"}
 	for _, name := range append(append([]string{}, names...), "excluded:db", "private,archive") {
 		if _, err := source.Database(name).Collection("probe").InsertOne(ctx, bson.M{
 			"_id": 1, "value": name, "payload": []byte{0, 1, 255, 39, 92, 10},

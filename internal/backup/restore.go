@@ -214,7 +214,7 @@ func (a *App) withBundle(ctx context.Context, args []string, r commandRunner, ac
 
 func (a *App) downloadBundle(ctx context.Context, key, version, dir string, r commandRunner) (Manifest, error) {
 	file := filepath.Join(dir, "backup"+a.Config.fileType())
-	fmt.Fprintf(a.Out, "Downloading backup: %s\n", key)
+	fmt.Fprintf(a.Out, "Downloading backup: %q\n", key)
 	if err := a.Store.Download(ctx, key, version, file); err != nil {
 		return Manifest{}, err
 	}

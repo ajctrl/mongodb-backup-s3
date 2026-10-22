@@ -304,6 +304,9 @@ Duration depends on compression CPU usage, network speed, and database read load
 `full` requires the oplog to cover the entire dump, so allow enough retention for increases in write volume.
 Avoid operations that `mongodump --oplog` does not support during a dump, such as renaming collections.
 
+Database names and S3 keys are quoted and escaped in application logs so control characters cannot create
+extra log records. The actual database names and S3 keys are unchanged; log parsers must account for the quotes.
+
 ## Restore
 
 Create `restore.env` with the same `S3_PREFIX`, `BACKUP_MODE`, `BACKUP_FILENAME_MODE`, and `PASSPHRASE` used for the backup,
@@ -434,6 +437,8 @@ fixture setup and restores use a separate administrator. Tests also verify that 
 prevent publication and that conditional writes preserve existing generations.
 Tests cover literal commas in JSON database selections/exclusions, scheduled recurrence after failures,
 overlap prevention, and SIGTERM/SIGINT during schedule waits and active multipart uploads.
+Control-character database names are backed up and restored without changing the names, and application
+log tests verify escaping on success, failure, retention, and download paths.
 Timeout tests run both installed tools against an unresponsive TCP endpoint and measure one- and two-second
 server-selection and connection timeouts. In Docker mode these tests use the host network on Linux.
 Shutdown checks require the expected exit code, no completed partial backup, aborted uploaded parts,

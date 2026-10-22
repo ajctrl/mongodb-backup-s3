@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 	_ "time/tzdata"
@@ -168,7 +169,7 @@ func (a *App) label(db string) string {
 	if a.Config.BackupMode == "full" {
 		return "full replica set"
 	}
-	return db
+	return strconv.Quote(db)
 }
 func (a *App) databases(ctx context.Context, source Source) ([]string, error) {
 	c := a.Config
@@ -244,7 +245,7 @@ func (a *App) dumpArgs(db string, auth bool) []string {
 func (a *App) backupDatabase(ctx context.Context, r commandRunner, source Source, db string, snapshot Snapshot, toolsVersion string) (string, error) {
 	now := a.now().UTC()
 	key := a.Config.backupKey(db, now)
-	fmt.Fprintf(a.Out, "Creating and uploading backup: %s (key: %s)\n", a.label(db), key)
+	fmt.Fprintf(a.Out, "Creating and uploading backup: %s (key: %q)\n", a.label(db), key)
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	reader, writer := io.Pipe()
