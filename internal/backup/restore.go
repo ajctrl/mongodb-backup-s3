@@ -48,7 +48,7 @@ func (a *App) RestoreAuth(ctx context.Context, args []string) error {
 	return a.restore(ctx, args, true)
 }
 func (a *App) restore(ctx context.Context, args []string, auth bool) error {
-	if err := a.Config.requireConnection(); err != nil {
+	if err := a.Config.requireRestoreConnection(); err != nil {
 		return err
 	}
 	if _, _, err := a.validateRestore(args); err != nil {
@@ -72,6 +72,8 @@ func (a *App) restore(ctx context.Context, args []string, auth bool) error {
 			}
 			// The complete bundle is already verified. Feed its compressed member
 			// directly to the tool to avoid a third full-size temporary copy.
+			// Tools may raise numParallelCollections to the archive's recorded
+			// concurrency to consume its multiplexed streams; it is not a hard cap.
 			cmd := append(a.connectionArgs(), "--archive", "--gzip", "--stopOnError", fmt.Sprintf("--numParallelCollections=%d", a.Config.ParallelCollections))
 			if a.Config.RestoreDrop {
 				cmd = append(cmd, "--drop")

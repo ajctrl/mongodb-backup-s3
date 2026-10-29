@@ -138,6 +138,12 @@ does not provide a MongoDB operation timeout. The metadata client's 30-second li
 Enable TLS with `tls=true` in the URI. For a custom CA, mount the CA file and set `MONGODB_TLS_CA_FILE` to its container path.
 Certificates collected as server configuration are not automatically applied to connection settings.
 
+**Breaking change:** `restore` and `restore-auth` reject `w=0` and repeated `w` URI options,
+including differently capitalized or percent-encoded forms. Unacknowledged writes can cause
+`mongorestore` to report success even when the server rejects documents. Omit `w` to use the tool's
+default, or select an acknowledged write concern such as `w=1` or `w=majority`.
+This validation also applies to `MONGODB_URI_FILE`; backup and configuration extraction are unaffected.
+
 Grant the backup account the `backup` and `clusterMonitor` roles on `admin`.
 `clusterMonitor` is used to retrieve the active replica set configuration and status.
 An administrator can create the account in `mongosh`:
@@ -414,7 +420,7 @@ Original ownership and permissions are not restored automatically; adjust them w
 | `MONGODB_URI` / `MONGODB_URI_FILE` | Required | Set one; not required for `extract-config` |
 | `MONGODB_READ_PREFERENCE` | `primary` | `primary` / `primaryPreferred` / `secondary` / `secondaryPreferred` / `nearest` |
 | `MONGODB_TLS_CA_FILE` | Empty | CA file for TLS verification |
-| `MONGODB_PARALLEL_COLLECTIONS` | `4` | Number of collections processed concurrently; 1–128 |
+| `MONGODB_PARALLEL_COLLECTIONS` | `4` | Dump concurrency and requested restore concurrency; 1–128. During restore, MongoDB Tools may increase this to consume the archive's multiplexed streams; this is not a restore concurrency cap. |
 | `MONGODB_CONFIG_DIR` | Empty | Directory containing configuration files to back up |
 | `MONGODB_RESTORE_DROP` | `false` | Drop target collections before restoring |
 | `BACKUP_MODE` | `full` | `full` / `per-database` |

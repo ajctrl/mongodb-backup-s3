@@ -1,6 +1,7 @@
 package backup
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -17,6 +18,46 @@ func testConfig(t *testing.T, values map[string]string) Config {
 	}
 	return c
 }
+
+func TestRestoreWriteConcern(t *testing.T) {
+	for _, tc := range []struct {
+		query string
+		valid bool
+	}{
+		{"", true}, {"w=1", true}, {"w=majority", true}, {"w=customTag", true},
+		{"W=2&journal=true", true}, {"w=%2B1", true},
+		{"w=0", false}, {"W=00", false}, {"%77=%30", false},
+		{"w=-0", false}, {"w=%2B0", false},
+		{"w=0&w=1", false}, {"w=1&W=0", false}, {"w=1&%77=1", false},
+	} {
+		for _, fromFile := range []bool{false, true} {
+			t.Run(tc.query+fmt.Sprint("/file=", fromFile), func(t *testing.T) {
+				uri := "mongodb://backup:SECRET@one:27017,two:27017/?authSource=admin&" + tc.query
+				values := map[string]string{"S3_BUCKET": "bucket", "MONGODB_URI": uri}
+				if fromFile {
+					path := filepath.Join(t.TempDir(), "uri")
+					if err := os.WriteFile(path, []byte(uri+"\n"), 0600); err != nil {
+						t.Fatal(err)
+					}
+					delete(values, "MONGODB_URI")
+					values["MONGODB_URI_FILE"] = path
+				}
+				c := testConfig(t, values)
+				if _, err := c.validateBackup(); err != nil {
+					t.Fatalf("restore-only restriction affected backup: %v", err)
+				}
+				err := c.requireRestoreConnection()
+				if (err == nil) != tc.valid {
+					t.Fatalf("valid=%v, error=%v", tc.valid, err)
+				}
+				if err != nil && strings.Contains(err.Error(), "SECRET") {
+					t.Fatal("error leaked URI credentials")
+				}
+			})
+		}
+	}
+}
+
 func TestConfigurationSelectionContracts(t *testing.T) {
 	base := map[string]string{"S3_BUCKET": "bucket", "MONGODB_URI": "mongodb://backup:secret@localhost/?replicaSet=rs0&authSource=admin"}
 	for _, tc := range []struct {

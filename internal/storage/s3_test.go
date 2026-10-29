@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -193,6 +194,7 @@ func TestS3RejectsIncompleteListings(t *testing.T) {
 		{"missing key", "<Contents><LastModified>2026-09-12T11:20:30Z</LastModified></Contents>"},
 		{"missing token", "<IsTruncated>true</IsTruncated>"},
 		{"repeated token", "<IsTruncated>true</IsTruncated><NextContinuationToken>again</NextContinuationToken>"},
+		{"unknown encoding", "<EncodingType>unknown</EncodingType>"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var calls atomic.Int32
@@ -206,6 +208,71 @@ func TestS3RejectsIncompleteListings(t *testing.T) {
 			objects, err := s.List(context.Background(), "backup/")
 			if err == nil || objects != nil || calls.Load() > 2 {
 				t.Fatalf("unsafe listing: objects = %v, err = %v, calls = %d", objects, err, calls.Load())
+			}
+		})
+	}
+}
+
+func TestS3ListEncodedKeys(t *testing.T) {
+	keys := []string{"backup/日本語+%2F\x01.zip", "backup/literal%+ space.zip"}
+	const token = "opaque%2F+token/="
+	var calls atomic.Int32
+	s := testS3(t, func(w http.ResponseWriter, r *http.Request) {
+		page := int(calls.Add(1)) - 1
+		q := r.URL.Query()
+		if q.Get("encoding-type") != "url" || q.Get("prefix") != "backup/" {
+			t.Errorf("list query = %s", r.URL.RawQuery)
+		}
+		if page > 1 {
+			t.Error("unexpected extra page")
+			writeS3Error(w, http.StatusBadRequest, "BadRequest")
+			return
+		}
+		var body strings.Builder
+		body.WriteString("<ListBucketResult><EncodingType>url</EncodingType>")
+		if page == 0 {
+			fmt.Fprintf(&body, "<IsTruncated>true</IsTruncated><NextContinuationToken>%s</NextContinuationToken>", token)
+		} else if q.Get("continuation-token") != token {
+			t.Errorf("opaque continuation token changed: %q", q.Get("continuation-token"))
+		}
+		fmt.Fprintf(&body, "<Contents><Key>%s</Key><LastModified>2026-09-12T11:20:30Z</LastModified></Contents></ListBucketResult>", url.PathEscape(keys[page]))
+		writeXML(w, body.String())
+	})
+	objects, err := s.List(t.Context(), "backup/")
+	if err != nil || len(objects) != len(keys) {
+		t.Fatalf("listing = %v, %v", objects, err)
+	}
+	for i, object := range objects {
+		if object.Key != keys[i] {
+			t.Errorf("key %d = %q, want %q", i, object.Key, keys[i])
+		}
+	}
+}
+
+func TestS3ListRawKeysAreNotDecoded(t *testing.T) {
+	s := testS3(t, func(w http.ResponseWriter, r *http.Request) {
+		writeXML(w, "<ListBucketResult><Contents><Key>literal%2F+%</Key><LastModified>2026-09-12T11:20:30Z</LastModified></Contents></ListBucketResult>")
+	})
+	objects, err := s.List(t.Context(), "")
+	if err != nil || len(objects) != 1 || objects[0].Key != "literal%2F+%" {
+		t.Fatalf("unencoded listing changed: %v, %v", objects, err)
+	}
+}
+
+func TestS3ListMalformedEncodingDiscardsEarlierPages(t *testing.T) {
+	for _, key := range []string{"bad%", "bad%0", "bad%GG"} {
+		t.Run(key, func(t *testing.T) {
+			var calls atomic.Int32
+			s := testS3(t, func(w http.ResponseWriter, r *http.Request) {
+				if calls.Add(1) == 1 {
+					writeXML(w, "<ListBucketResult><EncodingType>url</EncodingType><IsTruncated>true</IsTruncated><NextContinuationToken>next</NextContinuationToken><Contents><Key>valid.zip</Key><LastModified>2026-09-12T11:20:30Z</LastModified></Contents></ListBucketResult>")
+					return
+				}
+				writeXML(w, "<ListBucketResult><EncodingType>url</EncodingType><Contents><Key>"+key+"</Key><LastModified>2026-09-12T11:20:30Z</LastModified></Contents></ListBucketResult>")
+			})
+			objects, err := s.List(t.Context(), "")
+			if err == nil || objects != nil || calls.Load() != 2 {
+				t.Fatalf("partial or malformed listing accepted: %v, %v; calls=%d", objects, err, calls.Load())
 			}
 		})
 	}

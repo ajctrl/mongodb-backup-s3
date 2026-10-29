@@ -162,7 +162,7 @@ func (s *S3) Download(ctx context.Context, key, versionID, path string) error {
 
 func (s *S3) List(ctx context.Context, prefix string) ([]Object, error) {
 	paginator := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
-		Bucket: aws.String(s.bucket), Prefix: aws.String(prefix),
+		Bucket: aws.String(s.bucket), Prefix: aws.String(prefix), EncodingType: types.EncodingTypeUrl,
 	})
 	var objects []Object
 	tokens := make(map[string]bool)
@@ -171,12 +171,24 @@ func (s *S3) List(ctx context.Context, prefix string) ([]Object, error) {
 		if err != nil {
 			return nil, fmt.Errorf("list S3 objects: %w", err)
 		}
+		if page.EncodingType != "" && page.EncodingType != types.EncodingTypeUrl {
+			return nil, fmt.Errorf("S3 list response contains an unsupported key encoding")
+		}
 		for _, object := range page.Contents {
 			// Missing dates must not turn an unknown age into an expired backup.
 			if object.Key == nil || object.LastModified == nil {
 				return nil, fmt.Errorf("S3 list response contains an object without a key or modification time")
 			}
-			objects = append(objects, Object{Key: *object.Key, LastModified: *object.LastModified})
+			key := *object.Key
+			if page.EncodingType == types.EncodingTypeUrl {
+				// Encoding permits XML-incompatible characters in S3 keys. Decode
+				// exactly once, preserving literal '+' and encoded-looking names.
+				key, err = url.PathUnescape(key)
+				if err != nil {
+					return nil, fmt.Errorf("S3 list response contains an invalid URL-encoded key")
+				}
+			}
+			objects = append(objects, Object{Key: key, LastModified: *object.LastModified})
 		}
 		if aws.ToBool(page.IsTruncated) {
 			token := aws.ToString(page.NextContinuationToken)

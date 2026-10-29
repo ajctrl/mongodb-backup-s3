@@ -204,6 +204,32 @@ func readAppCommandLog(t *testing.T, path string) string {
 	return string(b)
 }
 
+func TestUnsafeRestoreWriteConcernStartsNoWork(t *testing.T) {
+	for _, query := range []string{"w=0", "w=1&W=0", "w=0&w=majority"} {
+		for _, command := range []string{"restore", "restore-auth"} {
+			t.Run(query+"/"+command, func(t *testing.T) {
+				a, store, _, log := newAppTest(t, "per-database")
+				a.Config.URI += "&" + query
+				var err error
+				if command == "restore" {
+					err = a.Restore(t.Context(), nil)
+				} else {
+					err = a.RestoreAuth(t.Context(), nil)
+				}
+				if err == nil || !strings.Contains(err.Error(), "restore requires") {
+					t.Fatalf("unsafe write concern was not rejected: %v", err)
+				}
+				if store.lists != 0 || store.downloadedKey != "" || readAppCommandLog(t, log) != "" {
+					t.Fatal("invalid write concern started S3 or external tool work")
+				}
+				if _, err := os.Stat(a.lockPath); !os.IsNotExist(err) {
+					t.Fatalf("invalid write concern accessed the backup lock: %v", err)
+				}
+			})
+		}
+	}
+}
+
 func TestUnsupportedOperationTimeoutsStartNoWork(t *testing.T) {
 	for _, key := range []string{"socketTimeoutMS", "timeoutMS"} {
 		for _, command := range []string{"backup", "run", "restore", "restore-auth"} {

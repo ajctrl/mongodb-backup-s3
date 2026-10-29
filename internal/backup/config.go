@@ -197,6 +197,32 @@ func (c Config) requireConnection() error {
 	return validateURI(c.URI)
 }
 
+func (c Config) requireRestoreConnection() error {
+	if err := c.requireConnection(); err != nil {
+		return err
+	}
+	// The URI/query are already validated. Avoid a driver parse here: SRV
+	// resolution would start network work before validating restore settings.
+	u, _ := mongoURIOptions(c.URI)
+	q, _ := url.ParseQuery(u.RawQuery)
+	seen := false
+	for key, values := range q {
+		if !strings.EqualFold(key, "w") {
+			continue
+		}
+		if seen || len(values) != 1 {
+			return fmt.Errorf("restore requires a single MONGODB_URI write concern w option")
+		}
+		seen = true
+		// Match the driver's integer interpretation, including 00 and -0.
+		// Named write concerns remain valid; the tools validate their names.
+		if w, err := strconv.Atoi(values[0]); err == nil && w == 0 {
+			return fmt.Errorf("restore requires acknowledged writes; remove w=0 from MONGODB_URI or use w=1 or w=majority")
+		}
+	}
+	return nil
+}
+
 func (c Config) validateBackup() (int, error) {
 	if err := c.requireConnection(); err != nil {
 		return 0, err
