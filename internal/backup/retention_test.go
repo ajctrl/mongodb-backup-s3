@@ -1,7 +1,9 @@
 package backup
 
 import (
+	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -107,5 +109,33 @@ func TestRetentionAcceptsLongMultipartUploadInterval(t *testing.T) {
 	}
 	if len(store.deleted) != 1 || store.deleted[0] != old || len(store.objects[published]) == 0 {
 		t.Fatalf("long upload retention failed: deleted=%v", store.deleted)
+	}
+}
+
+type recordingDeleteStore struct {
+	*appTestStore
+	batches []int
+}
+
+func (s *recordingDeleteStore) DeleteBatch(ctx context.Context, keys []string) error {
+	s.batches = append(s.batches, len(keys))
+	return s.appTestStore.DeleteBatch(ctx, keys)
+}
+func TestRetentionBatchesAfterValidation(t *testing.T) {
+	a, store, _, _ := newAppTest(t, "full")
+	rec := &recordingDeleteStore{appTestStore: store}
+	a.Store = rec
+	now := a.now()
+	published := a.Config.backupKey("", now)
+	store.objects[published], store.modified[published] = []byte("new"), now
+	for i := 0; i < 1001; i++ {
+		key := fmt.Sprintf("unit/full/2026-09-01T00:00:00-%032x.zip", i)
+		store.objects[key], store.modified[key] = []byte("old"), now.Add(-72*time.Hour)
+	}
+	if err := a.removeOldBackups(t.Context(), "", published, now, now, 1); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(rec.batches, []int{1000, 1}) || len(store.objects) != 1 {
+		t.Fatalf("delete batches=%v remaining=%d", rec.batches, len(store.objects))
 	}
 }

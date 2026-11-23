@@ -3,12 +3,18 @@ package storage
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
 	"os"
 	"path/filepath"
+
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -17,6 +23,8 @@ import (
 	transfertypes "github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager/types"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go/middleware"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
 type Object struct {
@@ -24,12 +32,14 @@ type Object struct {
 	LastModified time.Time
 }
 
+const MaxDeleteKeys = 1000
+
 type Store interface {
 	VersioningEnabled(context.Context) (bool, error)
 	Upload(ctx context.Context, key string, body io.ReadCloser, allowOverwrite bool) error
-	Download(ctx context.Context, key, versionID, path string) error
-	List(ctx context.Context, prefix string) ([]Object, error)
-	Delete(ctx context.Context, key string) error
+	Download(ctx context.Context, key, versionID string, path string) error
+	Walk(ctx context.Context, prefix string, visit func(Object) error) error
+	DeleteBatch(ctx context.Context, keys []string) error
 }
 
 type Config struct {
@@ -52,8 +62,7 @@ type S3 struct {
 var _ Store = (*S3)(nil)
 
 // New preserves the SDK credential chain (environment, profiles, web identity,
-// container and instance roles). Explicit credentials and the legacy S3 aliases
-// override their respective AWS environment values without mutating the process.
+// container and instance roles) unless a separate S3 credential set is supplied.
 func New(ctx context.Context, cfg Config) (*S3, error) {
 	return newS3(ctx, cfg, 60*time.Second)
 }
@@ -81,15 +90,13 @@ func newS3(ctx context.Context, cfg Config, idleTimeout time.Duration) (*S3, err
 	if cfg.Region != "" {
 		options = append(options, config.WithRegion(cfg.Region))
 	}
-	accessKey := firstNonempty(cfg.AccessKeyID, os.Getenv("S3_ACCESS_KEY_ID"))
-	secretKey := firstNonempty(cfg.SecretAccessKey, os.Getenv("S3_SECRET_ACCESS_KEY"))
-	token := firstNonempty(cfg.SessionToken, os.Getenv("S3_SESSION_TOKEN"))
+	accessKey, secretKey, token := cfg.AccessKeyID, cfg.SecretAccessKey, cfg.SessionToken
+	if accessKey == "" && secretKey == "" && token == "" {
+		accessKey, secretKey, token = os.Getenv("S3_ACCESS_KEY_ID"), os.Getenv("S3_SECRET_ACCESS_KEY"), os.Getenv("S3_SESSION_TOKEN")
+	}
 	if accessKey != "" || secretKey != "" || token != "" {
-		accessKey = firstNonempty(accessKey, os.Getenv("AWS_ACCESS_KEY_ID"), os.Getenv("AWS_ACCESS_KEY"))
-		secretKey = firstNonempty(secretKey, os.Getenv("AWS_SECRET_ACCESS_KEY"), os.Getenv("AWS_SECRET_KEY"))
-		token = firstNonempty(token, os.Getenv("AWS_SESSION_TOKEN"))
 		if accessKey == "" || secretKey == "" {
-			return nil, fmt.Errorf("S3 credential overrides require both an access key ID and secret access key (S3_* or AWS_* variables)")
+			return nil, fmt.Errorf("S3 credentials require both S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY")
 		}
 		options = append(options, config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKey, secretKey, token)))
 	}
@@ -160,24 +167,23 @@ func (s *S3) Download(ctx context.Context, key, versionID, path string) error {
 	return nil
 }
 
-func (s *S3) List(ctx context.Context, prefix string) ([]Object, error) {
+func (s *S3) Walk(ctx context.Context, prefix string, visit func(Object) error) error {
 	paginator := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
 		Bucket: aws.String(s.bucket), Prefix: aws.String(prefix), EncodingType: types.EncodingTypeUrl,
 	})
-	var objects []Object
 	tokens := make(map[string]bool)
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("list S3 objects: %w", err)
+			return fmt.Errorf("list S3 objects: %w", err)
 		}
 		if page.EncodingType != "" && page.EncodingType != types.EncodingTypeUrl {
-			return nil, fmt.Errorf("S3 list response contains an unsupported key encoding")
+			return fmt.Errorf("S3 list response contains an unsupported key encoding")
 		}
 		for _, object := range page.Contents {
 			// Missing dates must not turn an unknown age into an expired backup.
 			if object.Key == nil || object.LastModified == nil {
-				return nil, fmt.Errorf("S3 list response contains an object without a key or modification time")
+				return fmt.Errorf("S3 list response contains an object without a key or modification time")
 			}
 			key := *object.Key
 			if page.EncodingType == types.EncodingTypeUrl {
@@ -185,20 +191,56 @@ func (s *S3) List(ctx context.Context, prefix string) ([]Object, error) {
 				// exactly once, preserving literal '+' and encoded-looking names.
 				key, err = url.PathUnescape(key)
 				if err != nil {
-					return nil, fmt.Errorf("S3 list response contains an invalid URL-encoded key")
+					return fmt.Errorf("S3 list response contains an invalid URL-encoded key")
 				}
 			}
-			objects = append(objects, Object{Key: key, LastModified: *object.LastModified})
+			if err := visit(Object{Key: key, LastModified: *object.LastModified}); err != nil {
+				return err
+			}
 		}
 		if aws.ToBool(page.IsTruncated) {
 			token := aws.ToString(page.NextContinuationToken)
 			if token == "" || tokens[token] {
-				return nil, fmt.Errorf("S3 list response contains an invalid continuation token")
+				return fmt.Errorf("S3 list response contains an invalid continuation token")
 			}
 			tokens[token] = true
 		}
 	}
-	return objects, nil
+	return nil
+}
+
+// DeleteBatch deletes current keys only. Never send XML-invalid characters
+// via DeleteObjects: the SDK's XML encoder would change the object name.
+func (s *S3) DeleteBatch(ctx context.Context, keys []string) error {
+	if len(keys) > MaxDeleteKeys {
+		return fmt.Errorf("S3 delete batch exceeds %d keys", MaxDeleteKeys)
+	}
+	objects := make([]types.ObjectIdentifier, 0, len(keys))
+	for _, key := range keys {
+		if !utf8.ValidString(key) || strings.ContainsFunc(key, func(r rune) bool {
+			return r < 0x20 && r != '\t' && r != '\r' && r != '\n' || r == 0xfffe || r == 0xffff
+		}) {
+			if err := s.Delete(ctx, key); err != nil {
+				return err
+			}
+			continue
+		}
+		objects = append(objects, types.ObjectIdentifier{Key: aws.String(key)})
+	}
+	if len(objects) == 0 {
+		return nil
+	}
+	out, err := s.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+		Bucket: aws.String(s.bucket), Delete: &types.Delete{Objects: objects, Quiet: aws.Bool(true)},
+	}, func(o *s3.Options) { o.APIOptions = append(o.APIOptions, addDeleteContentMD5) })
+	if err != nil {
+		return fmt.Errorf("delete S3 objects: %w", err)
+	}
+	var failures []error
+	for _, item := range out.Errors {
+		failures = append(failures, fmt.Errorf("delete S3 object %q: %s", aws.ToString(item.Key), aws.ToString(item.Code)))
+	}
+	return errors.Join(failures...)
 }
 
 func (s *S3) Delete(ctx context.Context, key string) error {
@@ -211,11 +253,19 @@ func (s *S3) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
-func firstNonempty(values ...string) string {
-	for _, value := range values {
-		if value != "" {
-			return value
+// Hash the SDK's serialized XML before signing, so escaped keys and retries
+// carry the digest of the exact body sent to the S3 endpoint.
+func addDeleteContentMD5(stack *middleware.Stack) error {
+	return stack.Build.Add(middleware.BuildMiddlewareFunc("DeleteContentMD5", func(ctx context.Context, in middleware.BuildInput, next middleware.BuildHandler) (middleware.BuildOutput, middleware.Metadata, error) {
+		req := in.Request.(*smithyhttp.Request)
+		digest := md5.New()
+		if _, err := io.Copy(digest, req.GetStream()); err != nil {
+			return middleware.BuildOutput{}, middleware.Metadata{}, err
 		}
-	}
-	return ""
+		if err := req.RewindStream(); err != nil {
+			return middleware.BuildOutput{}, middleware.Metadata{}, err
+		}
+		req.Header.Set("Content-MD5", base64.StdEncoding.EncodeToString(digest.Sum(nil)))
+		return next.HandleBuild(ctx, in)
+	}), middleware.Before)
 }

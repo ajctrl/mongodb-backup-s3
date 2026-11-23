@@ -80,7 +80,6 @@ func TestPartialBackupRecovery(t *testing.T) {
 	env["BACKUP_FILENAME_MODE"] = "fixed"
 	f.run(t, env, "restore", "--version-id", firstVersion)
 	f.assertValue(t, target, "app", "original")
-	env["BACKUP_FILENAME_MODE"] = "timestamp"
 	f.run(t, env, "restore")
 	f.assertValue(t, target, "app", "timestamp")
 	if n, err := target.Database("analytics").Collection("probe").CountDocuments(ctx, bson.M{}); err != nil || n != 0 {

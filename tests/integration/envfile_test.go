@@ -54,7 +54,7 @@ func TestDockerEnvFileExamples(t *testing.T) {
 			sort.Strings(lines)
 			prefix := "envfile-" + name
 			contents := strings.Join(lines, "\n") + "\n" + examples[i] +
-				"MONGODB_CONFIG_DIR=\nS3_PREFIX=" + prefix + "\nBACKUP_FILENAME_MODE=fixed\n"
+				"MONGODB_CONFIG_DIR=\nS3_PREFIX=" + prefix + "\nBACKUP_FILENAME_MODE=fixed\nBACKUP_ALLOW_UNVERSIONED_OVERWRITE=true\n"
 			file := filepath.Join(t.TempDir(), "backup.env")
 			if err := os.WriteFile(file, []byte(contents), 0600); err != nil {
 				t.Fatal(err)

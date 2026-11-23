@@ -63,7 +63,7 @@ func TestBackupRestore(t *testing.T) {
 			if f.native {
 				t.Fatal("PREVIOUS_TOOLS_IMAGE requires Docker integration mode")
 			}
-			env := map[string]string{"S3_PREFIX": "previous-tools", "BACKUP_FILENAME_MODE": "fixed"}
+			env := map[string]string{"S3_PREFIX": "previous-tools", "BACKUP_FILENAME_MODE": "fixed", "BACKUP_ALLOW_UNVERSIONED_OVERWRITE": "true"}
 			writer := *f
 			writer.name += "-previous-tools"
 			writer.image = previous
@@ -134,6 +134,30 @@ func TestBackupRestore(t *testing.T) {
 			if err != nil || len(pending.Uploads) != 0 {
 				t.Fatalf("rejected upload not cleaned up: %+v %v", pending, err)
 			}
+		}
+	})
+
+	t.Run("retention_deletes_current_keys_in_bulk", func(t *testing.T) {
+		store, err := storage.New(ctx, storage.Config{Bucket: f.bucket, Region: "us-east-1", Endpoint: f.endpoint,
+			AccessKeyID: "integration", SecretAccessKey: testPassword})
+		if err != nil {
+			t.Fatal(err)
+		}
+		keys := []string{"bulk/a", "bulk/b"}
+		for _, key := range keys {
+			if err := store.Upload(ctx, key, io.NopCloser(strings.NewReader("saved")), false); err != nil {
+				t.Fatal(err)
+			}
+		}
+		before := f.version(t, keys[0])
+		if err := store.DeleteBatch(ctx, keys); err != nil {
+			t.Fatal(err)
+		}
+		if current := f.keys(t, "bulk/"); len(current) != 0 {
+			t.Fatalf("remaining keys: %v", current)
+		}
+		if err := store.Download(ctx, keys[0], before, filepath.Join(t.TempDir(), "previous")); err != nil {
+			t.Fatalf("historical version was lost: %v", err)
 		}
 	})
 
@@ -280,7 +304,7 @@ func TestBackupRestore(t *testing.T) {
 	})
 	if !t.Run("per_database_data_and_explicit_auth_restore", func(t *testing.T) {
 		env := map[string]string{
-			"S3_PREFIX": "selected", "BACKUP_MODE": "per-database", "BACKUP_FILENAME_MODE": "fixed",
+			"S3_PREFIX": "selected", "BACKUP_MODE": "per-database", "BACKUP_FILENAME_MODE": "fixed", "BACKUP_ALLOW_UNVERSIONED_OVERWRITE": "true",
 			"MONGODB_DATABASES": `["app","analytics"]`,
 		}
 		f.run(t, env, "backup")
@@ -323,7 +347,7 @@ func TestBackupRestore(t *testing.T) {
 
 	t.Run("database_discovery_and_exclusion", func(t *testing.T) {
 		f.run(t, map[string]string{
-			"S3_PREFIX": "discovered", "BACKUP_MODE": "per-database", "BACKUP_FILENAME_MODE": "fixed",
+			"S3_PREFIX": "discovered", "BACKUP_MODE": "per-database", "BACKUP_FILENAME_MODE": "fixed", "BACKUP_ALLOW_UNVERSIONED_OVERWRITE": "true",
 			"MONGODB_BACKUP_ALL": "true", "MONGODB_DATABASES_EXCLUDE": `["excluded"]`,
 		}, "backup")
 		want := "discovered/per-database/analytics/latest.zip,discovered/per-database/app/latest.zip"
@@ -340,7 +364,7 @@ func TestBackupRestore(t *testing.T) {
 		}
 		env := map[string]string{
 			"S3_PREFIX": "encrypted", "BACKUP_MODE": "per-database", "MONGODB_DATABASE": "app",
-			"BACKUP_FILENAME_MODE": "fixed", "PASSPHRASE": "integration encryption passphrase",
+			"BACKUP_FILENAME_MODE": "fixed", "BACKUP_ALLOW_UNVERSIONED_OVERWRITE": "true", "PASSPHRASE": "integration encryption passphrase",
 		}
 		const key = "encrypted/per-database/app/latest.zip.gpg"
 		f.setValue(t, source, "app", "first version")
@@ -391,7 +415,7 @@ func TestBackupRestore(t *testing.T) {
 	t.Run("failed_config_does_not_replace_successful_backup", func(t *testing.T) {
 		env := map[string]string{
 			"S3_PREFIX": "failed-config", "BACKUP_MODE": "per-database", "MONGODB_DATABASE": "app",
-			"BACKUP_FILENAME_MODE": "fixed",
+			"BACKUP_FILENAME_MODE": "fixed", "BACKUP_ALLOW_UNVERSIONED_OVERWRITE": "true",
 		}
 		f.run(t, env, "backup")
 		const key = "failed-config/per-database/app/latest.zip"

@@ -45,7 +45,7 @@ func TestSignalsDuringScheduledMultipartUpload(t *testing.T) {
 			defer f.command(t, source.Database("admin"), bson.D{{Key: "configureFailPoint", Value: "failCommand"}, {Key: "mode", Value: "off"}})
 			prefix := fmt.Sprintf("signal-%d", sig)
 			key := prefix + "/per-database/app/latest.zip"
-			env := map[string]string{"S3_PREFIX": prefix, "BACKUP_MODE": "per-database", "MONGODB_DATABASE": "app", "BACKUP_FILENAME_MODE": "fixed", "SCHEDULE": "@every 1s", "S3_UPLOAD_PART_SIZE_MB": "5"}
+			env := map[string]string{"S3_PREFIX": prefix, "BACKUP_MODE": "per-database", "MONGODB_DATABASE": "app", "BACKUP_FILENAME_MODE": "fixed", "BACKUP_ALLOW_UNVERSIONED_OVERWRITE": "true", "SCHEDULE": "@every 1s", "S3_UPLOAD_PART_SIZE_MB": "5"}
 			cmd, signal := f.backupCommand(t, env, "run")
 			logPath := filepath.Join(t.TempDir(), "backup.log")
 			log, err := os.Create(logPath)

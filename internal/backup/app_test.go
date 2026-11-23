@@ -97,19 +97,22 @@ func (s *appTestStore) Download(_ context.Context, key, version, path string) er
 	}
 	return os.WriteFile(path, b, 0600)
 }
-func (s *appTestStore) List(_ context.Context, prefix string) ([]storage.Object, error) {
+func (s *appTestStore) Walk(_ context.Context, prefix string, visit func(storage.Object) error) error {
 	s.lists++
-	var result []storage.Object
 	for key := range s.objects {
 		if strings.HasPrefix(key, prefix) {
-			result = append(result, storage.Object{Key: key, LastModified: s.modified[key]})
+			if err := visit(storage.Object{Key: key, LastModified: s.modified[key]}); err != nil {
+				return err
+			}
 		}
 	}
-	return result, nil
+	return nil
 }
-func (s *appTestStore) Delete(_ context.Context, key string) error {
-	s.deleted = append(s.deleted, key)
-	delete(s.objects, key)
+func (s *appTestStore) DeleteBatch(_ context.Context, keys []string) error {
+	s.deleted = append(s.deleted, keys...)
+	for _, key := range keys {
+		delete(s.objects, key)
+	}
 	return nil
 }
 
@@ -340,11 +343,11 @@ func TestBackupFilenamePolicy(t *testing.T) {
 		checkErr                  error
 		wantWarning               string
 	}{
-		{"enabled", "fixed", true, false, true, nil, ""},
+		{"enabled", "fixed", true, false, false, nil, "permission is disabled"},
 		{"enabled with override", "fixed", true, true, true, nil, ""},
-		{"disabled", "fixed", false, false, false, nil, "not Enabled"},
+		{"disabled", "fixed", false, false, false, nil, "permission is disabled"},
 		{"disabled with override", "fixed", false, true, true, nil, "not Enabled"},
-		{"denied", "fixed", false, false, false, errors.New("AccessDenied"), "AccessDenied"},
+		{"denied", "fixed", false, false, false, errors.New("AccessDenied"), "permission is disabled"},
 		{"network error with override", "fixed", false, true, true, errors.New("connection reset"), "connection reset"},
 		{"timestamp", "timestamp", true, false, false, nil, ""},
 		{"timestamp with override", "timestamp", true, true, false, nil, ""},
@@ -361,7 +364,7 @@ func TestBackupFilenamePolicy(t *testing.T) {
 				t.Fatal(err)
 			}
 			wantChecks := 0
-			if tc.mode == "fixed" {
+			if tc.mode == "fixed" && tc.allow {
 				wantChecks = 1
 			}
 			key := store.lastUploadedKey
@@ -387,7 +390,7 @@ func TestBackupFilenamePolicy(t *testing.T) {
 				if tc.wantFixed {
 					action = "BACKUP_ALLOW_UNVERSIONED_OVERWRITE=true"
 				}
-				for _, want := range []string{"Warning:", tc.wantWarning, action} {
+				for _, want := range []string{tc.wantWarning, action} {
 					if !strings.Contains(warnings.String(), want) {
 						t.Fatalf("warning missing %q: %s", want, &warnings)
 					}
@@ -397,7 +400,7 @@ func TestBackupFilenamePolicy(t *testing.T) {
 	}
 }
 
-func TestFallbackRestoresLoggedGenerationAndRechecksNextRun(t *testing.T) {
+func TestProtectedFixedRestoresLoggedGenerationAcrossVersioningChanges(t *testing.T) {
 	a, store, source, _ := newAppTest(t, "per-database")
 	var output bytes.Buffer
 	a.Out = &output
@@ -407,7 +410,7 @@ func TestFallbackRestoresLoggedGenerationAndRechecksNextRun(t *testing.T) {
 	a.Config.Databases = []string{"app", "analytics"}
 	store.versions = false
 	a.newSource = func(context.Context, Config) (Source, error) {
-		if store.versionChecks != 1 {
+		if store.versionChecks != 0 {
 			t.Fatalf("versioning checks before MongoDB access: %d", store.versionChecks)
 		}
 		return source, nil
@@ -415,7 +418,7 @@ func TestFallbackRestoresLoggedGenerationAndRechecksNextRun(t *testing.T) {
 	if err := a.Backup(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if len(store.objects) != 2 || store.versionChecks != 1 {
+	if len(store.objects) != 2 || store.versionChecks != 0 {
 		t.Fatalf("objects=%d versioning checks=%d", len(store.objects), store.versionChecks)
 	}
 	for _, db := range a.Config.Databases {
@@ -440,12 +443,12 @@ func TestFallbackRestoresLoggedGenerationAndRechecksNextRun(t *testing.T) {
 	if err := a.Backup(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if store.versionChecks != 2 || len(store.objects) != 4 {
+	if store.versionChecks != 0 || len(store.objects) != 4 {
 		t.Fatalf("second run: checks=%d objects=%d", store.versionChecks, len(store.objects))
 	}
 	for _, db := range a.Config.Databases {
-		if len(store.objects[a.Config.fixedKey(db)]) == 0 {
-			t.Fatalf("second run did not update fixed key for %q", db)
+		if len(store.objects[a.Config.fixedKey(db)]) != 0 {
+			t.Fatalf("second run overwrote fixed key for %q", db)
 		}
 	}
 }
@@ -735,6 +738,7 @@ func TestMissingExplicitDatabaseFailsBeforeAnyUpload(t *testing.T) {
 func TestExplicitAuthenticationRestoreAndVersionSelection(t *testing.T) {
 	a, store, _, log := newAppTest(t, "per-database")
 	a.Config.FilenameMode = "fixed"
+	a.Config.AllowUnversionedOverwrite = true
 	if err := a.Backup(t.Context()); err != nil {
 		t.Fatal(err)
 	}

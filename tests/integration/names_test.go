@@ -46,7 +46,7 @@ func TestLinuxDatabaseNames(t *testing.T) {
 		}
 	}
 	f.run(t, map[string]string{
-		"S3_PREFIX": "literal-selection", "BACKUP_MODE": "per-database", "BACKUP_FILENAME_MODE": "fixed",
+		"S3_PREFIX": "literal-selection", "BACKUP_MODE": "per-database", "BACKUP_FILENAME_MODE": "fixed", "BACKUP_ALLOW_UNVERSIONED_OVERWRITE": "true",
 		"MONGODB_DATABASES": `["selected,db","app"]`,
 	}, "backup")
 	if got := strings.Join(f.keys(t, "literal-selection/"), "\n"); got != "literal-selection/per-database/app/latest.zip\nliteral-selection/per-database/selected%2Cdb/latest.zip" {

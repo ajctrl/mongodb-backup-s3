@@ -3,6 +3,8 @@ package storage
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
+	"encoding/base64"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -21,6 +23,15 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 )
+
+func (s *S3) List(ctx context.Context, prefix string) ([]Object, error) {
+	var objects []Object
+	err := s.Walk(ctx, prefix, func(obj Object) error { objects = append(objects, obj); return nil })
+	if err != nil {
+		return nil, err
+	}
+	return objects, nil
+}
 
 func isolatedAWS(t *testing.T) {
 	t.Helper()
@@ -448,10 +459,10 @@ func TestS3CredentialOverridesAndDefaultChain(t *testing.T) {
 		wantToken  string
 	}{
 		{"AWS environment", Config{}, map[string]string{"AWS_ACCESS_KEY_ID": "aws-key", "AWS_SECRET_ACCESS_KEY": "aws-secret", "AWS_SESSION_TOKEN": "aws-token"}, false, "aws-key", "aws-secret", "aws-token"},
-		{"S3 key only", Config{}, map[string]string{"S3_ACCESS_KEY_ID": "s3-key", "AWS_SECRET_ACCESS_KEY": "aws-secret", "AWS_SESSION_TOKEN": "aws-token"}, false, "s3-key", "aws-secret", "aws-token"},
-		{"S3 secret only", Config{}, map[string]string{"AWS_ACCESS_KEY_ID": "aws-key", "S3_SECRET_ACCESS_KEY": "s3-secret"}, false, "aws-key", "s3-secret", ""},
-		{"explicit key only", Config{AccessKeyID: "explicit-key"}, map[string]string{"AWS_SECRET_ACCESS_KEY": "aws-secret", "AWS_SESSION_TOKEN": "aws-token"}, false, "explicit-key", "aws-secret", "aws-token"},
-		{"S3 token", Config{}, map[string]string{"AWS_ACCESS_KEY_ID": "aws-key", "AWS_SECRET_ACCESS_KEY": "aws-secret", "S3_SESSION_TOKEN": "s3-token"}, false, "aws-key", "aws-secret", "s3-token"},
+		{"S3 pair", Config{}, map[string]string{"S3_ACCESS_KEY_ID": "s3-key", "S3_SECRET_ACCESS_KEY": "s3-secret", "AWS_SESSION_TOKEN": "unrelated"}, false, "s3-key", "s3-secret", ""},
+		{"explicit pair", Config{AccessKeyID: "key", SecretAccessKey: "secret"}, map[string]string{"S3_SESSION_TOKEN": "other", "AWS_SESSION_TOKEN": "unrelated"}, false, "key", "secret", ""},
+		{"incomplete S3 pair", Config{}, map[string]string{"S3_ACCESS_KEY_ID": "s3-key", "AWS_SECRET_ACCESS_KEY": "other"}, false, "", "", ""},
+		{"isolated S3 token", Config{}, map[string]string{"AWS_ACCESS_KEY_ID": "aws-key", "AWS_SECRET_ACCESS_KEY": "aws-secret", "S3_SESSION_TOKEN": "s3-token"}, false, "", "", ""},
 		{"shared profile", Config{}, nil, true, "profile-key", "profile-secret", "profile-token"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -470,6 +481,12 @@ func TestS3CredentialOverridesAndDefaultChain(t *testing.T) {
 			cfg := test.config
 			cfg.Bucket = "test-bucket"
 			s, err := New(context.Background(), cfg)
+			if test.wantKey == "" {
+				if err == nil {
+					t.Fatal("accepted incomplete S3 credentials")
+				}
+				return
+			}
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -551,4 +568,47 @@ func openUpload(t *testing.T, path string) *os.File {
 	}
 	t.Cleanup(func() { f.Close() })
 	return f
+}
+
+func TestDeleteBatchPreservesKeysAndReportsItemErrors(t *testing.T) {
+	const special = "control\x01/key"
+	const normal = "a<&\rkey"
+	for _, fail := range []bool{false, true} {
+		var single, batch atomic.Int32
+		store := testS3(t, func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodDelete && r.URL.Path == "/test-bucket/"+special:
+				single.Add(1)
+				w.WriteHeader(http.StatusNoContent)
+			case r.Method == http.MethodPost && r.URL.Query().Has("delete"):
+				batch.Add(1)
+				var payload struct {
+					Objects []struct {
+						Key       string
+						VersionID *string `xml:"VersionId"`
+					} `xml:"Object"`
+				}
+				body, err := io.ReadAll(r.Body)
+				digest := md5.Sum(body)
+				if err != nil || r.Header.Get("Content-MD5") != base64.StdEncoding.EncodeToString(digest[:]) {
+					t.Error("invalid Content-MD5 for serialized delete body")
+				}
+				if err := xml.Unmarshal(body, &payload); err != nil || len(payload.Objects) != 1 || payload.Objects[0].Key != normal || payload.Objects[0].VersionID != nil {
+					t.Errorf("delete payload=%+v err=%v", payload, err)
+				}
+				if fail {
+					writeXML(w, `<DeleteResult><Error><Key>failed-key</Key><Code>AccessDenied</Code></Error></DeleteResult>`)
+				} else {
+					writeXML(w, `<DeleteResult/>`)
+				}
+			default:
+				t.Errorf("unexpected delete %s %s", r.Method, r.URL)
+				w.WriteHeader(http.StatusBadRequest)
+			}
+		})
+		err := store.DeleteBatch(t.Context(), []string{special, normal})
+		if (err != nil) != fail || (fail && (!strings.Contains(err.Error(), "failed-key") || !strings.Contains(err.Error(), "AccessDenied"))) || single.Load() != 1 || batch.Load() != 1 {
+			t.Fatalf("delete failure=%v calls=%d/%d err=%v", fail, single.Load(), batch.Load(), err)
+		}
+	}
 }

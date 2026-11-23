@@ -1,8 +1,10 @@
 package backup
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"encoding/gob"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -123,6 +125,10 @@ func (a App) Backup(ctx context.Context) error {
 		return err
 	}
 	defer lock.Close()
+	if a.Config.FilenameMode == "fixed" && !a.Config.AllowUnversionedOverwrite {
+		fmt.Fprintln(a.Err, "Using timestamp filenames because fixed-key overwrite permission is disabled.")
+		a.Config.FilenameMode = "timestamp"
+	}
 	if a.Config.FilenameMode == "fixed" {
 		enabled, err := a.Store.VersioningEnabled(ctx)
 		if ctx.Err() != nil {
@@ -133,12 +139,7 @@ func (a App) Backup(ctx context.Context) error {
 			if err != nil {
 				reason = fmt.Sprintf("could not verify S3 bucket versioning (%q)", err.Error())
 			}
-			if a.Config.AllowUnversionedOverwrite {
-				fmt.Fprintf(a.Err, "Warning: %s. BACKUP_ALLOW_UNVERSIONED_OVERWRITE=true permits overwriting the fixed key and may replace the previous backup.\n", reason)
-			} else {
-				fmt.Fprintf(a.Err, "Warning: %s. Using timestamp filenames for this run and leaving the fixed key untouched.\n", reason)
-				a.Config.FilenameMode = "timestamp"
-			}
+			fmt.Fprintf(a.Err, "Warning: %s. BACKUP_ALLOW_UNVERSIONED_OVERWRITE=true permits overwriting the fixed key and may replace the previous backup.\n", reason)
 		}
 	}
 	if a.Config.BackupMode == "full" && a.Config.ReadPreference != "primary" {
@@ -427,36 +428,27 @@ func produceEncrypted(ctx context.Context, out io.Writer, r commandRunner, encry
 	return errors.Join(err, <-done)
 }
 
-func (a *App) timestampBackups(ctx context.Context, db string) ([]storage.Object, error) {
-	objects, err := a.Store.List(ctx, a.Config.timestampPrefix(db))
-	if err != nil {
-		return nil, err
-	}
-	var backups []storage.Object
-	for _, obj := range objects {
-		if a.Config.isTimestampBackup(db, obj.Key) {
-			backups = append(backups, obj)
-		}
-	}
-	return backups, nil
-}
-
 // S3 may timestamp multipart objects at initiation rather than completion.
 // Compare its timestamp with the entire capture/upload interval, allowing for
 // timestamp precision and small clock differences, before deleting anything.
 const retentionClockTolerance = 5 * time.Minute
 
 func (a *App) removeOldBackups(ctx context.Context, db, publishedKey string, started, completed time.Time, days int) error {
-	objects, err := a.Store.List(ctx, a.Config.timestampPrefix(db))
+	// Spool managed keys while validating all pages. Deletion begins only after
+	// the complete listing, timestamps and local clock have passed validation.
+	spool, err := os.CreateTemp("", "mongodb-backup-s3-retention-")
 	if err != nil {
 		return err
 	}
+	defer os.Remove(spool.Name())
+	defer spool.Close()
+	buffer := bufio.NewWriter(spool)
+	enc := gob.NewEncoder(buffer)
 	var published, newest time.Time
-	var backups []storage.Object
-	for _, obj := range objects {
+	err = a.Store.Walk(ctx, a.Config.timestampPrefix(db), func(obj storage.Object) error {
 		managed := a.Config.isTimestampBackup(db, obj.Key)
 		if !managed && obj.Key != publishedKey {
-			continue
+			return nil
 		}
 		if obj.LastModified.IsZero() {
 			return fmt.Errorf("missing modification time for %q", obj.Key)
@@ -464,12 +456,22 @@ func (a *App) removeOldBackups(ctx context.Context, db, publishedKey string, sta
 		if obj.Key == publishedKey {
 			published = obj.LastModified
 		}
-		if managed {
-			backups = append(backups, obj)
-			if obj.LastModified.After(newest) {
-				newest = obj.LastModified
-			}
+		if !managed {
+			return nil
 		}
+		if obj.LastModified.After(newest) {
+			newest = obj.LastModified
+		}
+		return enc.Encode(obj)
+	})
+	if err != nil {
+		return err
+	}
+	if err := buffer.Flush(); err != nil {
+		return err
+	}
+	if _, err := spool.Seek(0, io.SeekStart); err != nil {
+		return err
 	}
 	if published.IsZero() {
 		return fmt.Errorf("retention refused: newly published backup %q is missing from S3 listing", publishedKey)
@@ -479,7 +481,17 @@ func (a *App) removeOldBackups(ctx context.Context, db, publishedKey string, sta
 	}
 	// Use the new object's S3 timestamp, not the host clock, as the age reference.
 	cutoff := published.Add(-time.Duration(days) * 24 * time.Hour)
-	for _, obj := range backups {
+	batch := make([]string, 0, storage.MaxDeleteKeys)
+	dec := gob.NewDecoder(bufio.NewReader(spool))
+	for {
+		var obj storage.Object
+		err := dec.Decode(&obj)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -489,10 +501,17 @@ func (a *App) removeOldBackups(ctx context.Context, db, publishedKey string, sta
 			continue
 		}
 		if obj.LastModified.Before(cutoff) {
-			if err := a.Store.Delete(ctx, obj.Key); err != nil {
-				return err
+			batch = append(batch, obj.Key)
+			if len(batch) == storage.MaxDeleteKeys {
+				if err := a.Store.DeleteBatch(ctx, batch); err != nil {
+					return err
+				}
+				batch = batch[:0]
 			}
 		}
+	}
+	if len(batch) > 0 {
+		return a.Store.DeleteBatch(ctx, batch)
 	}
 	return nil
 }

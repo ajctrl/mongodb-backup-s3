@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/ajctrl/mongodb-backup-s3/internal/storage"
 	"os"
 	"path/filepath"
 	"strings"
@@ -35,6 +36,9 @@ func (a *App) validateRestore(args []string) (string, string, error) {
 		return args[0], "", nil
 	case 2:
 		if c.FilenameMode == "fixed" && args[0] == "--version-id" && args[1] != "" {
+			if args[1] == "null" {
+				return "", "", fmt.Errorf("S3 null versions are mutable; specify an immutable version ID or a timestamp generation")
+			}
 			return "", args[1], nil
 		}
 	}
@@ -151,19 +155,16 @@ func (a *App) withBundle(ctx context.Context, args []string, r commandRunner, ac
 	}
 	var keys []string
 	c := a.Config
-	if c.FilenameMode == "fixed" {
+	if version != "" {
 		keys = []string{c.fixedKey(c.Database)}
 	} else if generation != "" {
 		keys = []string{c.timestampPrefix(c.Database) + generation + c.fileType()}
 	} else {
-		objects, err := a.timestampBackups(ctx, c.Database)
-		if err != nil {
-			return err
-		}
 		var newest time.Time
-		for _, obj := range objects {
-			if !strings.HasSuffix(obj.Key, c.fileType()) {
-				continue
+		err := a.Store.Walk(ctx, c.timestampPrefix(c.Database), func(obj storage.Object) error {
+			fixed := c.FilenameMode == "fixed" && obj.Key == c.fixedKey(c.Database)
+			if !fixed && !(c.isTimestampBackup(c.Database, obj.Key) && strings.HasSuffix(obj.Key, c.fileType())) {
+				return nil
 			}
 			if obj.LastModified.IsZero() {
 				return fmt.Errorf("missing LastModified for backup %q", obj.Key)
@@ -174,6 +175,10 @@ func (a *App) withBundle(ctx context.Context, args []string, r commandRunner, ac
 			} else if obj.LastModified.Equal(newest) {
 				keys = append(keys, obj.Key)
 			}
+			return nil
+		})
+		if err != nil {
+			return err
 		}
 		if len(keys) == 0 {
 			return fmt.Errorf("no matching backup found")
