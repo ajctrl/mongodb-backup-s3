@@ -14,7 +14,20 @@ export GITHUB_SHA HEAD_SHA IMAGE_DIGEST
 repo=$registry/fixture/backup-$BASHPID
 publish=(bash .github/scripts/publish-image.sh)
 mkdir -p "$RUNNER_TEMP"/{bin,tested,context}
-printf '#!/bin/sh\necho "$HEAD_SHA"\n' > "$RUNNER_TEMP/bin/gh"
+cat > "$RUNNER_TEMP/bin/gh" <<'MOCK'
+#!/usr/bin/env bash
+set -eu
+case "$1" in
+  api) echo "$HEAD_SHA" ;;
+  attestation)
+    [[ "$2" == verify && "$4" == --repo && "$5" == "$GITHUB_REPOSITORY" &&
+       "$6" == --signer-workflow && "$7" == "$GITHUB_REPOSITORY/.github/workflows/verify.yml" &&
+       "$8" == --source-digest && "$9" == "$GITHUB_SHA" && "${10}" == --deny-self-hosted-runners ]]
+    grep -Fxq "$GITHUB_SHA $3" "$RUNNER_TEMP/signed"
+    ;;
+  *) exit 1 ;;
+esac
+MOCK
 chmod +x "$RUNNER_TEMP/bin/gh"
 export PATH="$RUNNER_TEMP/bin:$PATH"
 printf 'FROM scratch\nCOPY payload /payload\n' > "$RUNNER_TEMP/context/Dockerfile"
@@ -23,15 +36,25 @@ make_archives() {
   echo "$1" > "$RUNNER_TEMP/context/payload"
   for arch in amd64 arm64; do
     docker buildx build --platform "linux/$arch" --provenance=mode=max \
+      --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+      --label "org.opencontainers.image.source=${GITHUB_SERVER_URL:-https://github.com}/$GITHUB_REPOSITORY" \
       --tag "fixture:$arch" --output "type=oci,dest=$RUNNER_TEMP/tested/image-$arch.tar" "$RUNNER_TEMP/context"
   done
 }
 
-make_archives first
+publish_tested_archives() {
+  "${publish[@]}" prepare "$repo"
+  local digest
+  digest=$(regctl image digest "ocidir://$RUNNER_TEMP/tested-layout:tested")
+  echo "$GITHUB_SHA oci://$repo@$digest" >> "$RUNNER_TEMP/signed"
+  PREPARED_DIGEST=$digest "${publish[@]}" publish "$repo"
+}
+
 sha_a=$(printf 'a%.0s' {1..40})
 sha_b=$(printf 'b%.0s' {1..40})
 GITHUB_SHA=$sha_a
-"${publish[@]}" publish "$repo"
+make_archives first
+publish_tested_archives
 digest_a=$(regctl image digest "$repo:sha-$sha_a")
 
 # Read each provenance statement back from the registry and check its subject
@@ -50,10 +73,10 @@ for arch in amd64 arm64; do
     (.predicateType | startswith("https://slsa.dev/provenance/")) and any(.subject[]; .digest.sha256 == $sha)' >/dev/null
 done
 
-make_archives second
 GITHUB_SHA=$sha_b
+make_archives second
 HEAD_SHA=$sha_b
-"${publish[@]}" publish "$repo"
+publish_tested_archives
 IMAGE_DIGEST=$(regctl image digest "$repo:sha-$sha_b")
 [[ "$IMAGE_DIGEST" != "$digest_a" ]]
 "${publish[@]}" latest "$repo"
@@ -68,3 +91,44 @@ make_archives retry
 "${publish[@]}" latest "$repo"
 [[ "$(regctl image digest "$repo:sha-$sha_b")" == "$IMAGE_DIGEST" ]]
 [[ "$(regctl image digest "$repo:latest")" == "$IMAGE_DIGEST" ]]
+
+# A release reference accepts retries for its original digest only.
+GITHUB_REF=refs/tags/v1.0.0-build
+"${publish[@]}" publish "$repo"
+"${publish[@]}" publish "$repo"
+GITHUB_REF=refs/tags/v1.0.0+build
+if "${publish[@]}" publish "$repo"; then exit 1; fi
+GITHUB_REF=refs/tags/v1.0.0-build
+GITHUB_SHA=$sha_a
+if "${publish[@]}" publish "$repo"; then exit 1; fi
+[[ "$(regctl image digest "$repo:v1.0.0-build")" == "$IMAGE_DIGEST" ]]
+
+mirror=$registry/fixture/mirror-$BASHPID
+GITHUB_REF=refs/heads/main
+GITHUB_SHA=$sha_a
+"${publish[@]}" publish "$repo" "$mirror"
+"${publish[@]}" publish "$repo" "$mirror"
+[[ "$(regctl image digest "$mirror:sha-$sha_a")" == "$digest_a" ]]
+regctl image copy "$repo@$digest_a" "$mirror:sha-$sha_b"
+GITHUB_SHA=$sha_b
+if "${publish[@]}" publish "$repo" "$mirror"; then exit 1; fi
+[[ "$(regctl image digest "$mirror:sha-$sha_b")" == "$digest_a" ]]
+
+# Neither a single-platform manifest nor a complete index for another commit
+# may acquire a release tag merely because it occupies a SHA tag.
+GITHUB_SHA=$(printf 'c%.0s' {1..40})
+GITHUB_REF=refs/tags/v2.0.0
+single=$(regctl image digest --platform linux/amd64 "$repo@$digest_a")
+for invalid in "$single" "$digest_a"; do
+  echo "$GITHUB_SHA oci://$repo@$invalid" >> "$RUNNER_TEMP/signed"
+  regctl image copy "$repo@$invalid" "$repo:sha-$GITHUB_SHA"
+  if "${publish[@]}" publish "$repo"; then exit 1; fi
+  if regctl image digest "$repo:v2.0.0" 2>/dev/null; then exit 1; fi
+done
+
+# A complete, correctly labeled index for this commit still needs a trusted signature.
+make_archives unsigned
+"${publish[@]}" prepare "$repo"
+regctl image copy "ocidir://$RUNNER_TEMP/tested-layout:tested" "$repo:sha-$GITHUB_SHA"
+if "${publish[@]}" publish "$repo"; then exit 1; fi
+if regctl image digest "$repo:v2.0.0" 2>/dev/null; then exit 1; fi

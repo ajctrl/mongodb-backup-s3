@@ -27,7 +27,7 @@ Replace them with `mongodb-backup-s3 run`, `mongodb-backup-s3 backup`, and `mong
 The default command remains `mongodb-backup-s3 run`.
 
 After the first image is published to GHCR, run it with the following commands.
-`latest` tracks builds from `main`. Use a published `v*` tag to pin a version.
+`latest` tracks builds from `main`. Release tags must already be valid Docker tags, start with `v`, and fit within 128 ASCII characters. Publication refuses to move an existing release tag to a different digest.
 For private packages, run `docker login ghcr.io` first.
 
 ```sh

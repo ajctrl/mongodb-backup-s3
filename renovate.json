@@ -6,6 +6,10 @@
   "postUpdateOptions": ["gomodTidy", "gomodUpdateImportPaths"],
   "packageRules": [
     {
+      "matchManagers": ["github-actions"],
+      "pinDigests": true
+    },
+    {
       "matchManagers": ["gomod"],
       "matchDepTypes": ["indirect"],
       "enabled": true
@@ -37,6 +41,14 @@
     }
   ],
   "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/workflows/renovate\\.yml$/"],
+      "matchStrings": ["renovate-image: ghcr.io/renovatebot/renovate:(?<currentValue>[0-9]+)@(?<currentDigest>sha256:[a-f0-9]{64})"],
+      "datasourceTemplate": "docker",
+      "depNameTemplate": "ghcr.io/renovatebot/renovate",
+      "versioningTemplate": "docker"
+    },
     {
       "customType": "regex",
       "managerFilePatterns": ["/^\\.github/workflows/verify\\.yml$/"],
