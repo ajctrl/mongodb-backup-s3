@@ -51,7 +51,7 @@ const (
 // override paths with MONGOD_TEST_BINARY, SILO_TEST_BINARY, BACKUP_TEST_BINARY.
 // No existing database, container or bucket is modified by this suite.
 func TestBackupRestore(t *testing.T) {
-	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Minute)
+	ctx, cancel := fixtureContext(t, 15*time.Minute)
 	defer cancel()
 	f := newFixture(t, ctx)
 	source := f.connect(t, f.sourceURI)
@@ -387,6 +387,21 @@ type fixture struct {
 	runNumber                        int
 	tlsConfig                        *tls.Config
 	secondaryPort                    string
+}
+
+// Fetch cold images outside each fixture's startup and round-trip deadline.
+func fixtureContext(t *testing.T, timeout time.Duration) (context.Context, context.CancelFunc) {
+	t.Helper()
+	if os.Getenv("MONGODB_NATIVE_INTEGRATION") != "1" {
+		setup, cancel := context.WithTimeout(t.Context(), 10*time.Minute)
+		defer cancel()
+		for _, image := range []string{envOr("MONGODB_TEST_IMAGE", defaultMongoTestImage), envOr("S3_TEST_IMAGE", defaultS3TestImage)} {
+			if exec.CommandContext(setup, "docker", "image", "inspect", image).Run() != nil {
+				docker(t, setup, "pull", image)
+			}
+		}
+	}
+	return context.WithTimeout(t.Context(), timeout)
 }
 
 func newFixture(t *testing.T, ctx context.Context) *fixture {

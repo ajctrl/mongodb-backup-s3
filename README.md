@@ -16,7 +16,7 @@ Designed for self-managed replica sets. Sharded clusters, standalone servers, an
 
 ## Usage
 
-Supports Linux amd64 / arm64 and includes `mongodump` and `mongorestore` from MongoDB Database Tools **100.19.1**.
+Supports Linux amd64 / arm64 and includes `mongodump` and `mongorestore` from MongoDB Database Tools **100.20.1**.
 Integration tests target MongoDB 8.0.38. Verify restores with the same Server / FCV / Tools combination used in production.
 
 The image uses a custom distroless runtime built from `scratch`, with MongoDB Tools, GPG,
@@ -66,8 +66,8 @@ services:
       S3_BUCKET: my-backup-bucket
       S3_REGION: us-west-1
       S3_PREFIX: backup
-      S3_ACCESS_KEY_ID: "${S3_ACCESS_KEY_ID:?Set S3_ACCESS_KEY_ID}"
-      S3_SECRET_ACCESS_KEY: "${S3_SECRET_ACCESS_KEY:?Set S3_SECRET_ACCESS_KEY}"
+      S3_ACCESS_KEY_ID: "${S3_ACCESS_KEY_ID:-}"
+      S3_SECRET_ACCESS_KEY: "${S3_SECRET_ACCESS_KEY:-}"
       S3_SESSION_TOKEN: "${S3_SESSION_TOKEN:-}"
       S3_ENDPOINT: "${S3_ENDPOINT:-}"
       SCHEDULE: "CRON_TZ=Asia/Tokyo 0 2 * * *"
@@ -474,8 +474,11 @@ docker build -t mongodb-backup-s3:integration .
 go test -count=1 -tags=integration -v -timeout=20m ./tests/integration
 ```
 
+The build verifies the Database Tools archive against the repository-pinned MongoDB CLI Tools release key before extraction.
+Image tests check the compression library in all three shipped Go binaries. [MongoDB signature verification](https://www.mongodb.com/docs/database-tools/verify/gpg/)
+
 Integration tests start disposable MongoDB replica set and Silo containers.
-CI runs the final image's runtime checks and backup/restore integration suite on native amd64 and arm64
+CI pulls both fixture images before starting the per-test timeouts. CI runs the final image's runtime checks and backup/restore integration suite on native amd64 and arm64
 runners. Both architectures must pass before the publishing job runs.
 Backup commands use a dedicated account with only `backup` and `clusterMonitor` roles;
 fixture setup and restores use a separate administrator. Tests also verify that insufficient privileges

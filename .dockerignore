@@ -9,6 +9,7 @@
 !internal/**
 !src/
 !src/*.sh
+!src/mongodb-tools.asc
 **/*_test.go
 .tools/
 mariadb-backup-s3-main/

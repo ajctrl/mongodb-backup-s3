@@ -3,7 +3,6 @@
 package integration_test
 
 import (
-	"context"
 	"strings"
 	"testing"
 	"time"
@@ -12,7 +11,7 @@ import (
 )
 
 func TestLinuxDatabaseNames(t *testing.T) {
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
+	ctx, cancel := fixtureContext(t, 5*time.Minute)
 	defer cancel()
 	f := newFixture(t, ctx)
 	source, target := f.connect(t, f.sourceURI), f.connect(t, f.targetURI)

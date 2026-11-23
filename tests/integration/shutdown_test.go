@@ -20,7 +20,7 @@ import (
 )
 
 func TestSignalsDuringScheduledMultipartUpload(t *testing.T) {
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
+	ctx, cancel := fixtureContext(t, 5*time.Minute)
 	defer cancel()
 	f := newFixture(t, ctx)
 	source := f.connect(t, f.sourceURI)

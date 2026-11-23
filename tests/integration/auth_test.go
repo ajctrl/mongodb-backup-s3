@@ -3,7 +3,6 @@
 package integration_test
 
 import (
-	"context"
 	"testing"
 	"time"
 
@@ -15,7 +14,7 @@ import (
 // Exercise restore-auth without a preceding full restore: independently created
 // root accounts have different identities even with the same name and password.
 func TestAuthRestoreFreshDestination(t *testing.T) {
-	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
+	ctx, cancel := fixtureContext(t, 3*time.Minute)
 	defer cancel()
 	f := newFixture(t, ctx)
 	source := f.connect(t, f.sourceURI)

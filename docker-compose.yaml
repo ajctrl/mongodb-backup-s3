@@ -10,8 +10,22 @@ services:
       - sh
       - -ec
       - |
-        if [ ! -f /bootstrap/keyFile ]; then
-          head -c 512 /dev/urandom | base64 > /bootstrap/keyFile
+        if [ ! -e /bootstrap/keyFile ]; then
+          umask 077
+          tmp=$$(mktemp /bootstrap/.keyFile.XXXXXX)
+          trap 'rm -f "$$tmp"' EXIT
+          head -c 512 /dev/urandom | base64 > "$$tmp"
+          [ "$$(tr -d '[:space:]' < "$$tmp" | wc -c)" -eq 684 ]
+          chmod 400 "$$tmp"
+          chown 999:999 "$$tmp"
+          ln "$$tmp" /bootstrap/keyFile || [ -f /bootstrap/keyFile ]
+        fi
+        # This volume holds the single base64 key generated above.
+        length=$$(tr -d '[:space:]' < /bootstrap/keyFile | wc -c)
+        if [ "$$length" -lt 6 ] || [ "$$length" -gt 1024 ] ||
+           LC_ALL=C grep -q '[^A-Za-z0-9+/=[:space:]]' /bootstrap/keyFile; then
+          echo 'Invalid existing replica set key in /bootstrap/keyFile' >&2
+          exit 1
         fi
         chmod 400 /bootstrap/keyFile
         chown 999:999 /bootstrap/keyFile

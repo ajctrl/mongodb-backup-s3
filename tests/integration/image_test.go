@@ -6,6 +6,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"debug/buildinfo"
 	"io"
 	"os"
 	"os/exec"
@@ -14,6 +15,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/mod/semver"
 )
 
 // The distroless image must retain runtime data and the GPG agent needed for
@@ -44,6 +47,24 @@ func TestImageRuntime(t *testing.T) {
 		}
 		container := strings.TrimSpace(string(id))
 		defer dockerCleanup(t, "rm", "-v", container)
+		for _, binary := range []string{"mongodb-backup-s3", "mongodump", "mongorestore"} {
+			local := filepath.Join(dir, binary)
+			docker(t, ctx, "cp", container+":/usr/local/bin/"+binary, local)
+			info, err := buildinfo.ReadFile(local)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var version string
+			for _, dep := range info.Deps {
+				if dep.Path == "github.com/klauspost/compress" && dep.Replace == nil {
+					version = dep.Version
+					break
+				}
+			}
+			if !semver.IsValid(version) || semver.Compare(version, "v1.20.2") < 0 {
+				t.Fatalf("%s includes unverified or vulnerable klauspost/compress %q", binary, version)
+			}
+		}
 		export := filepath.Join(dir, "rootfs.tar")
 		docker(t, ctx, "export", "--output", export, container)
 		file, err := os.Open(export)

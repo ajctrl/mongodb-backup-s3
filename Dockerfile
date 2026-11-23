@@ -15,7 +15,8 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
 
 FROM ubuntu:${UBUNTU_VERSION} AS tools
 ARG TARGETARCH
-ARG MONGODB_TOOLS_VERSION=100.19.1
+ARG MONGODB_TOOLS_VERSION=100.20.1
+COPY src/mongodb-tools.asc /mongodb-tools.asc
 COPY src/install.sh /install.sh
 RUN TARGETARCH="${TARGETARCH}" MONGODB_TOOLS_VERSION="${MONGODB_TOOLS_VERSION}" \
     sh /install.sh && rm /install.sh

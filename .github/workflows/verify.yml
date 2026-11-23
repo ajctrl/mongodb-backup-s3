@@ -27,6 +27,8 @@ jobs:
         run: go test -count=1 -race ./...
       - name: Verify follow-up PR selection
         run: bash tests/ci/refresh.sh
+      - name: Verify Compose examples and replica set key initialization
+        run: bash tests/ci/compose.sh
       - name: Vet
         run: go vet ./...
       - name: Check formatting
@@ -108,11 +110,19 @@ jobs:
             docker run --rm mongodb-backup-s3:integration mongorestore --version | grep -Fx "mongorestore version: $current"
             echo "PREVIOUS_TOOLS_IMAGE=mongodb-backup-s3:previous-tools" >> "$GITHUB_ENV"
           fi
+      - name: Pull integration fixture images
+        timeout-minutes: 10
+        run: |
+          for fixture in defaultMongoTestImage defaultS3TestImage; do
+            image=$(sed -nE "s/^[[:space:]]*$fixture[[:space:]]*=[[:space:]]*\"([^\"]+)\"$/\1/p" tests/integration/docker_test.go)
+            test -n "$image"
+            docker pull "$image"
+          done
       - name: MongoDB replica set and S3 round trips
         env:
           BACKUP_TEST_IMAGE: mongodb-backup-s3:integration
         run: go test -count=1 -tags=integration -v -timeout=20m ./tests/integration
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: github.ref == 'refs/heads/main' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
         with:
           name: image-${{ matrix.arch }}

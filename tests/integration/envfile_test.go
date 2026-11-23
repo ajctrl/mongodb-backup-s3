@@ -3,7 +3,6 @@
 package integration_test
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"sort"
@@ -34,7 +33,7 @@ func TestDockerEnvFileExamples(t *testing.T) {
 	if len(examples) != 2 {
 		t.Fatalf("expected selection and exclusion examples, got %d", len(examples))
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
+	ctx, cancel := fixtureContext(t, 5*time.Minute)
 	defer cancel()
 	f := newFixture(t, ctx)
 	source := f.connect(t, f.sourceURI)

@@ -3,7 +3,6 @@
 package integration_test
 
 import (
-	"context"
 	"strings"
 	"testing"
 	"time"
@@ -12,7 +11,7 @@ import (
 )
 
 func TestRestoreWriteConcernAndEncodedKeys(t *testing.T) {
-	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
+	ctx, cancel := fixtureContext(t, 3*time.Minute)
 	defer cancel()
 	f := newFixture(t, ctx)
 	source := f.connect(t, f.sourceURI)
