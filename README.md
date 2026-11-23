@@ -19,6 +19,12 @@ Designed for self-managed replica sets. Sharded clusters, standalone servers, an
 Supports Linux amd64 / arm64 and includes `mongodump` and `mongorestore` from MongoDB Database Tools **100.19.1**.
 Integration tests target MongoDB 8.0. Verify restores with the same Server / FCV / Tools combination used in production.
 
+The image uses a custom distroless runtime built from `scratch`, with MongoDB Tools, GPG,
+their matching Ubuntu libraries, CA certificates, and timezone data. It contains no shell or package manager.
+**Breaking change:** `/run.sh`, `/backup.sh`, and `/restore.sh` have been removed.
+Replace them with `mongodb-backup-s3 run`, `mongodb-backup-s3 backup`, and `mongodb-backup-s3 restore` respectively.
+The default command remains `mongodb-backup-s3 run`.
+
 After the first image is published to GHCR, run it with the following commands.
 `latest` tracks builds from `main`. Use a published `v*` tag to pin a version.
 For private packages, run `docker login ghcr.io` first.
@@ -482,4 +488,3 @@ an S3 image override must accept the same server arguments and credential variab
 For local binaries, set `MONGODB_NATIVE_INTEGRATION=1` and optionally
 `MONGOD_TEST_BINARY`, `SILO_TEST_BINARY`, and `BACKUP_TEST_BINARY`.
 `SILO_TEST_BINARY` replaces `MINIO_TEST_BINARY` and defaults to `silo` on PATH.
-Shell wrappers `/run.sh`, `/backup.sh`, and `/restore.sh` forward to the corresponding Go command.

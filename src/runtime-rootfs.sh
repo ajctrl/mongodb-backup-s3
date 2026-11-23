@@ -1,5 +1,5 @@
 #!/bin/sh
-# Assemble the runtime from Ubuntu's binaries and their matching libraries.
+# Assemble a shell-free distroless runtime from Ubuntu's binaries and libraries.
 # Keep the official MongoDB tools on glibc without shipping the build OS.
 set -eu
 
@@ -24,7 +24,7 @@ copy_binary() {
 }
 
 for binary in /usr/local/bin/mongodump /usr/local/bin/mongorestore \
-    /usr/bin/gpg /usr/bin/gpg-agent /usr/bin/gpgconf /bin/sh; do
+    /usr/bin/gpg /usr/bin/gpg-agent /usr/bin/gpgconf; do
     copy_binary "$binary"
 done
 

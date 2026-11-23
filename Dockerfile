@@ -22,6 +22,7 @@ RUN TARGETARCH="${TARGETARCH}" MONGODB_TOOLS_VERSION="${MONGODB_TOOLS_VERSION}" 
 COPY src/runtime-rootfs.sh /runtime-rootfs.sh
 RUN sh /runtime-rootfs.sh
 
+# Custom distroless runtime: matching glibc libraries, no shell or package manager.
 FROM scratch
 COPY --from=tools /runtime-rootfs/ /
 COPY --from=build /out/mongodb-backup-s3 /usr/local/bin/mongodb-backup-s3
@@ -53,6 +54,5 @@ ENV PATH=/usr/local/bin:/usr/bin:/bin \
     BACKUP_KEEP_DAYS="" \
     BACKUP_FILENAME_MODE=timestamp
 
-COPY --chmod=755 src/run.sh src/backup.sh src/restore.sh /
 COPY LICENSE LICENSE.txt /usr/share/licenses/mongodb-backup-s3/
 CMD ["mongodb-backup-s3", "run"]
