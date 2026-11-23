@@ -156,7 +156,12 @@ func TestBackupRestore(t *testing.T) {
 		if current := f.keys(t, "bulk/"); len(current) != 0 {
 			t.Fatalf("remaining keys: %v", current)
 		}
-		if err := store.Download(ctx, keys[0], before, filepath.Join(t.TempDir(), "previous")); err != nil {
+		file, err := os.CreateTemp(t.TempDir(), "previous")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer file.Close()
+		if err := store.Download(ctx, keys[0], before, file); err != nil {
 			t.Fatalf("historical version was lost: %v", err)
 		}
 	})
@@ -248,6 +253,20 @@ func TestBackupRestore(t *testing.T) {
 		env["MONGODB_URI"] = f.targetURI
 		env["MONGODB_RESTORE_DROP"] = "true"
 		generation := strings.TrimSuffix(filepath.Base(keys[0]), ".zip")
+		existingTarget := f.connect(t, f.targetURI)
+		if _, err := existingTarget.Database("targetonly").Collection("probe").InsertOne(ctx,
+			bson.M{"_id": 1, "value": "preserve", "payload": []byte{0, 1, 255, 39, 92, 10}}); err != nil {
+			t.Fatal(err)
+		}
+		for _, drop := range []string{"false", "true"} {
+			env["MONGODB_RESTORE_DROP"] = drop
+			log, err := f.runCommand(t, env, "restore", generation)
+			if err == nil || !strings.Contains(log, "MONGODB_RESTORE_ALLOW_NONEMPTY_TARGET") {
+				t.Fatalf("full restore accepted existing target with drop=%s: %v %s", drop, err, log)
+			}
+			f.assertValue(t, existingTarget, "targetonly", "preserve")
+		}
+		env["MONGODB_RESTORE_ALLOW_NONEMPTY_TARGET"] = "true"
 		f.run(t, env, "restore", generation)
 		// The restore replaces the destination root user's identity as well as
 		// its credentials. Verify through a newly authenticated connection.

@@ -3,13 +3,14 @@ package backup
 import (
 	"archive/zip"
 	"context"
-	"errors"
 	"fmt"
-	"github.com/ajctrl/mongodb-backup-s3/internal/storage"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
+
+	"github.com/ajctrl/mongodb-backup-s3/internal/storage"
 )
 
 func (a *App) validateRestore(args []string) (string, string, error) {
@@ -64,9 +65,14 @@ func (a *App) restore(ctx context.Context, args []string, auth bool) error {
 	}
 	defer lock.Close()
 	return a.withRunner(lock, func(r commandRunner) error {
-		return a.withBundle(ctx, args, r, func(z *zip.ReadCloser, m Manifest, _ string) error {
+		return a.withBundle(ctx, args, r, func(z *zip.Reader, m Manifest) error {
 			if len(m.ExcludedConfigCollections) > 0 {
 				fmt.Fprintf(a.Err, "Warning: this backup excludes config database collections %q.\n", m.ExcludedConfigCollections)
+			}
+			if m.Oplog || a.Config.RestoreDrop {
+				if err := a.checkRestoreVersions(ctx, m); err != nil {
+					return err
+				}
 			}
 			name := "data.archive.gz"
 			if auth {
@@ -94,7 +100,7 @@ func (a *App) restore(ctx context.Context, args []string, auth bool) error {
 				if err := a.restoreArchive(ctx, r, f, append(cmd,
 					"--nsInclude=admin.system.users", "--nsInclude=admin.system.roles",
 					"--nsInclude=admin.system.version")...); err != nil {
-					return err
+					return fmt.Errorf("restore users and roles: %w", err)
 				}
 			}
 			if auth {
@@ -113,13 +119,36 @@ func (a *App) restore(ctx context.Context, args []string, auth bool) error {
 				fmt.Fprintf(a.Out, "Restoring backup created with %s (MongoDB %s, FCV %s)...\n", m.ToolsVersion, m.ServerVersion, m.FCV)
 			}
 			if err := a.restoreArchive(ctx, r, f, cmd...); err != nil {
-				return err
+				return fmt.Errorf("apply %s: %w", name, err)
 			}
 			fmt.Fprintln(a.Out, "Restore complete.")
 			return nil
 		})
 	})
 }
+
+// Archives contain metadata and may contain an oplog. Permit patch updates
+// within the same MongoDB release series while requiring matching FCVs.
+func (a *App) checkRestoreVersions(ctx context.Context, m Manifest) error {
+	dst, err := a.targetVersions(ctx, a.Config)
+	if err != nil {
+		return fmt.Errorf("inspect destructive restore target: %w", err)
+	}
+	target := releaseSeries.FindStringSubmatch(dst.ServerVersion)
+	source := releaseSeries.FindStringSubmatch(m.ServerVersion)
+	if (m.ServerVersion != "" && (source == nil || target == nil || source[1] != target[1])) || (m.FCV != "" && m.FCV != dst.FCV) {
+		return fmt.Errorf("destructive restore version mismatch: source MongoDB %q FCV %q, target MongoDB %q FCV %q", m.ServerVersion, m.FCV, dst.ServerVersion, dst.FCV)
+	}
+	if m.ServerVersion == "" || m.FCV == "" {
+		if m.Mode != "partial" || !a.Config.AllowUnknownSourceVersion {
+			return fmt.Errorf("source versions unknown or incomplete; destructive partial restore requires MONGODB_RESTORE_ALLOW_UNKNOWN_SOURCE_VERSION=true")
+		}
+		fmt.Fprintln(a.Err, "Warning: proceeding with destructive partial restore with incomplete source versions")
+	}
+	return nil
+}
+
+var releaseSeries = regexp.MustCompile(`^([0-9]+[.][0-9]+)(?:[.]|$)`)
 
 func (a *App) restoreArchive(ctx context.Context, r commandRunner, f *zip.File, args ...string) error {
 	archive, err := f.Open()
@@ -137,9 +166,21 @@ func (a *App) ExtractConfig(ctx context.Context, dest string, args []string) err
 	if _, _, err := a.validateRestore(args); err != nil {
 		return err
 	}
+	dest, err := filepath.Abs(dest)
+	if err != nil {
+		return err
+	}
+	if err := checkConfigDestination(dest); err != nil {
+		return err
+	}
+	dir, err := os.MkdirTemp(filepath.Dir(dest), ".mongodb-config-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
 	return a.withRunner(nil, func(r commandRunner) error {
-		return a.withBundle(ctx, args, r, func(z *zip.ReadCloser, _ Manifest, _ string) error {
-			if err := extractConfiguration(ctx, z, dest); err != nil {
+		return a.withBundle(ctx, args, r, func(z *zip.Reader, _ Manifest) error {
+			if err := extractConfiguration(ctx, z, dir, dest); err != nil {
 				return err
 			}
 			fmt.Fprintln(a.Out, "Configuration extracted; review paths, hosts, permissions and certificates before applying.")
@@ -148,7 +189,7 @@ func (a *App) ExtractConfig(ctx context.Context, dest string, args []string) err
 	})
 }
 
-func (a *App) withBundle(ctx context.Context, args []string, r commandRunner, action func(*zip.ReadCloser, Manifest, string) error) error {
+func (a *App) withBundle(ctx context.Context, args []string, r commandRunner, action func(*zip.Reader, Manifest) error) error {
 	generation, version, err := a.validateRestore(args)
 	if err != nil {
 		return err
@@ -184,71 +225,81 @@ func (a *App) withBundle(ctx context.Context, args []string, r commandRunner, ac
 			return fmt.Errorf("no matching backup found")
 		}
 	}
-	return withWorkspace(func(dir string) error {
-		var selectedDir string
-		var selected Manifest
-		ambiguous := false
-		// Only tied S3 timestamps require extra downloads. Keep at most the
-		// current winner and one candidate on disk, and validate all candidates
-		// before any import. Never fall back past an unreadable candidate.
-		for _, key := range keys {
-			candidateDir, err := os.MkdirTemp(dir, "candidate-")
-			if err != nil {
-				return err
+
+	var selected *downloadedBundle
+	defer func() {
+		if selected != nil {
+			selected.file.Close()
+		}
+	}()
+	ambiguous := false
+	for _, key := range keys {
+		candidate, err := a.downloadBundle(ctx, key, version, r)
+		if err != nil {
+			return fmt.Errorf("validate backup %q: %w", key, err)
+		}
+		if selected == nil || candidate.manifest.CompletedAt.After(selected.manifest.CompletedAt) {
+			if selected != nil {
+				selected.file.Close()
 			}
-			m, err := a.downloadBundle(ctx, key, version, candidateDir, r)
-			if err != nil {
-				return fmt.Errorf("validate backup %q: %w", key, err)
-			}
-			discard := candidateDir
-			if selectedDir == "" || m.CompletedAt.After(selected.CompletedAt) {
-				discard = selectedDir
-				selectedDir, selected = candidateDir, m
-				ambiguous = false
-			} else if m.CompletedAt.Equal(selected.CompletedAt) {
+			selected = candidate
+			ambiguous = false
+		} else {
+			candidate.file.Close()
+			if candidate.manifest.CompletedAt.Equal(selected.manifest.CompletedAt) {
 				ambiguous = true
 			}
-			if discard != "" {
-				if err := os.RemoveAll(discard); err != nil {
-					return err
-				}
-			}
 		}
-		if ambiguous {
-			return fmt.Errorf("latest backup is ambiguous: S3 LastModified and manifest completed_at are identical; specify an explicit generation")
-		}
-		z, err := zip.OpenReader(filepath.Join(selectedDir, "backup.zip"))
-		if err != nil {
-			return err
-		}
-		defer z.Close()
-		return action(z, selected, selectedDir)
-	})
+	}
+	if ambiguous {
+		return fmt.Errorf("latest backup is ambiguous: S3 LastModified and manifest completed_at are identical; specify an explicit generation")
+	}
+	return action(selected.reader, selected.manifest)
 }
 
-func (a *App) downloadBundle(ctx context.Context, key, version, dir string, r commandRunner) (Manifest, error) {
-	file := filepath.Join(dir, "backup"+a.Config.fileType())
+type downloadedBundle struct {
+	file     *os.File
+	reader   *zip.Reader
+	manifest Manifest
+}
+
+func (a *App) downloadBundle(ctx context.Context, key, version string, r commandRunner) (_ *downloadedBundle, err error) {
 	fmt.Fprintf(a.Out, "Downloading backup: %q\n", key)
-	if err := a.Store.Download(ctx, key, version, file); err != nil {
-		return Manifest{}, err
+	file, err := anonymousFile()
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err != nil {
+			file.Close()
+		}
+	}()
+	if err = a.Store.Download(ctx, key, version, file); err != nil {
+		return nil, err
 	}
 	if a.Config.Passphrase != "" {
-		plain := filepath.Join(dir, "backup.zip")
-		w, err := os.OpenFile(plain, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		plain, err := anonymousFile()
 		if err != nil {
-			return Manifest{}, err
+			return nil, err
 		}
-		err = r.run(ctx, w, "gpg", "--decrypt", "--batch", "--pinentry-mode", "loopback", file)
-		err = errors.Join(err, w.Close())
-		if err != nil {
-			return Manifest{}, err
+		if err := r.runInput(ctx, file, plain, "gpg", "--decrypt", "--batch", "--pinentry-mode", "loopback", "--output", "-"); err != nil {
+			plain.Close()
+			return nil, err
 		}
+		file.Close()
 		file = plain
 	}
-	z, err := zip.OpenReader(file)
+	info, err := file.Stat()
 	if err != nil {
-		return Manifest{}, fmt.Errorf("open backup bundle: %w", err)
+		return nil, err
+	}
+	z, err := zip.NewReader(file, info.Size())
+	if err != nil {
+		return nil, fmt.Errorf("open backup bundle: %w", err)
 	}
 	m, err := validateBundle(ctx, z, a.Config)
-	return m, errors.Join(err, z.Close())
+	if err != nil {
+		return nil, err
+	}
+	return &downloadedBundle{file: file, reader: z, manifest: m}, nil
 }

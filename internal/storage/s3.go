@@ -10,7 +10,6 @@ import (
 	"io"
 	"net/url"
 	"os"
-	"path/filepath"
 
 	"strings"
 	"time"
@@ -37,7 +36,7 @@ const MaxDeleteKeys = 1000
 type Store interface {
 	VersioningEnabled(context.Context) (bool, error)
 	Upload(ctx context.Context, key string, body io.ReadCloser, allowOverwrite bool) error
-	Download(ctx context.Context, key, versionID string, path string) error
+	Download(ctx context.Context, key, versionID string, dst io.WriterAt) error
 	Walk(ctx context.Context, prefix string, visit func(Object) error) error
 	DeleteBatch(ctx context.Context, keys []string) error
 }
@@ -135,18 +134,12 @@ func (s *S3) VersioningEnabled(ctx context.Context) (bool, error) {
 	return out.Status == types.BucketVersioningStatusEnabled, nil
 }
 
-func (s *S3) Download(ctx context.Context, key, versionID, path string) error {
+func (s *S3) Download(ctx context.Context, key, versionID string, dst io.WriterAt) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	f, err := os.CreateTemp(filepath.Dir(path), ".s3-download-*")
-	if err != nil {
-		return fmt.Errorf("create download file: %w", err)
-	}
-	defer os.Remove(f.Name())
-	defer f.Close()
 	input := &transfermanager.DownloadObjectInput{
-		Bucket: aws.String(s.bucket), Key: aws.String(key), WriterAt: f,
+		Bucket: aws.String(s.bucket), Key: aws.String(key), WriterAt: dst,
 	}
 	if versionID != "" {
 		input.VersionID = aws.String(versionID)
@@ -154,17 +147,7 @@ func (s *S3) Download(ctx context.Context, key, versionID, path string) error {
 	if _, err := s.transfer.DownloadObject(ctx, input); err != nil {
 		return fmt.Errorf("download S3 object %q: %w", key, err)
 	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("close download file: %w", err)
-	}
-	// Never expose an incomplete download to the restore client, including on retries.
-	if err := os.Rename(f.Name(), path); err != nil {
-		return fmt.Errorf("finish download file: %w", err)
-	}
-	return nil
+	return ctx.Err()
 }
 
 func (s *S3) Walk(ctx context.Context, prefix string, visit func(Object) error) error {

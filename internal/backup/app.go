@@ -21,16 +21,17 @@ import (
 )
 
 type App struct {
-	Config    Config
-	Store     storage.Store
-	Out, Err  io.Writer
-	now       func() time.Time
-	lockPath  string
-	newSource func(context.Context, Config) (Source, error)
+	Config         Config
+	Store          storage.Store
+	Out, Err       io.Writer
+	now            func() time.Time
+	lockPath       string
+	newSource      func(context.Context, Config) (Source, error)
+	targetVersions func(context.Context, Config) (Snapshot, error)
 }
 
 func New(c Config, s storage.Store, out, stderr io.Writer) *App {
-	return &App{Config: c, Store: s, Out: out, Err: stderr, now: time.Now, lockPath: "/tmp/mongodb-backup-s3.lock", newSource: NewSource}
+	return &App{Config: c, Store: s, Out: out, Err: stderr, now: time.Now, lockPath: "/tmp/mongodb-backup-s3.lock", newSource: NewSource, targetVersions: targetVersions}
 }
 func parseSchedule(spec string) (cron.Schedule, error) {
 	fields := strings.Fields(spec)
@@ -100,15 +101,6 @@ func (r commandRunner) withURI(uri string) commandRunner {
 	encoded, _ := json.Marshal(uri)
 	r.defaults = "uri: " + string(encoded) + "\n"
 	return r
-}
-
-func withWorkspace(action func(string) error) (err error) {
-	dir, err := os.MkdirTemp("", "mongodb-backup-s3-")
-	if err != nil {
-		return err
-	}
-	defer func() { err = errors.Join(err, os.RemoveAll(dir)) }()
-	return action(dir)
 }
 
 // Effective backup and filename modes apply only to this run.

@@ -30,7 +30,9 @@ func (r commandRunner) runInput(ctx context.Context, stdin io.Reader, stdout io.
 	}
 	defer closeFiles()
 	cmd.Stdin = stdin
-	cmd.Stdout = stdout
+	if name != "mongorestore" {
+		cmd.Stdout = stdout
+	}
 	// Streaming stdout may still be draining after the producer exits.
 	cmd.WaitDelay = 0
 	return commandError(ctx, name, cmd.Run())
@@ -38,7 +40,10 @@ func (r commandRunner) runInput(ctx context.Context, stdin io.Reader, stdout io.
 
 func (r commandRunner) command(ctx context.Context, name string, args ...string) (*exec.Cmd, func(), error) {
 	cmd := exec.CommandContext(ctx, name, args...)
-	cmd.Stderr = r.stderr
+	// Restore errors can contain complete BSON documents on either stream.
+	if name != "mongorestore" {
+		cmd.Stderr = r.stderr
+	}
 	authMechanism := ""
 	if name == "mongodump" || name == "mongorestore" {
 		authMechanism = r.authMechanism

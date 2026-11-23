@@ -32,7 +32,8 @@ type Config struct {
 	Database, BackupAll, BackupMode                      string
 	Databases, Exclude                                   []string
 	Prefix, Passphrase, KeepDays, FilenameMode, Schedule string
-	RestoreDrop                                          bool
+	RestoreDrop, AllowUnknownSourceVersion               bool
+	AllowNonemptyFullRestore                             bool
 	AllowUnversionedOverwrite                            bool
 	ParallelCollections                                  int
 	Storage                                              storage.Config
@@ -114,6 +115,16 @@ func loadConfig(lookup func(string) (string, bool)) (Config, error) {
 		return c, fmt.Errorf("MONGODB_RESTORE_DROP must be true or false")
 	}
 	c.RestoreDrop = drop == "true"
+	allowUnknown := valueOr("MONGODB_RESTORE_ALLOW_UNKNOWN_SOURCE_VERSION", "false")
+	if allowUnknown != "true" && allowUnknown != "false" {
+		return c, fmt.Errorf("MONGODB_RESTORE_ALLOW_UNKNOWN_SOURCE_VERSION must be true or false")
+	}
+	c.AllowUnknownSourceVersion = allowUnknown == "true"
+	allowNonempty := valueOr("MONGODB_RESTORE_ALLOW_NONEMPTY_TARGET", "false")
+	if allowNonempty != "true" && allowNonempty != "false" {
+		return c, fmt.Errorf("MONGODB_RESTORE_ALLOW_NONEMPTY_TARGET must be true or false")
+	}
+	c.AllowNonemptyFullRestore = allowNonempty == "true"
 	n, err := strconv.Atoi(valueOr("MONGODB_PARALLEL_COLLECTIONS", "4"))
 	if err != nil || n < 1 || n > 128 {
 		return c, fmt.Errorf("MONGODB_PARALLEL_COLLECTIONS must be between 1 and 128")

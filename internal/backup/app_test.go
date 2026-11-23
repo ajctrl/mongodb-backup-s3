@@ -85,17 +85,18 @@ func (s *appTestStore) Upload(ctx context.Context, key string, body io.ReadClose
 	s.modified[key] = time.Date(2026, 9, 13, 3, 0, 0, 0, time.UTC)
 	return nil
 }
-func (s *appTestStore) Download(_ context.Context, key, version, path string) error {
+func (s *appTestStore) Download(_ context.Context, key, version string, dst io.WriterAt) error {
 	s.downloadedKey, s.versionID = key, version
 	if s.downloadErr != nil {
-		_ = os.WriteFile(path, []byte("partial download"), 0600)
+		_, _ = dst.WriteAt([]byte("partial download"), 0)
 		return s.downloadErr
 	}
 	b, ok := s.objects[key]
 	if !ok {
 		return fmt.Errorf("missing object %s", key)
 	}
-	return os.WriteFile(path, b, 0600)
+	_, err := dst.WriteAt(b, 0)
+	return err
 }
 func (s *appTestStore) Walk(_ context.Context, prefix string, visit func(storage.Object) error) error {
 	s.lists++
@@ -156,13 +157,11 @@ test "$secret" = 'unit gpg passphrase'
 test -z "${PASSPHRASE+x}"
 test -z "${MONGODB_URI+x}"
 decrypt=no
-last=''
 for arg in "$@"; do
   if [ "$arg" = --decrypt ]; then decrypt=yes; fi
-  last="$arg"
 done
 if [ "$decrypt" = yes ]; then
-  cat "$last"
+  cat
   if [ "${TEST_GPG_FAILURE:-}" = decrypt ]; then exec 1>&-; exit 21; fi
 else
   cat
@@ -201,6 +200,9 @@ fi
 	a.lockPath = filepath.Join(dir, "lock")
 	a.now = func() time.Time { return time.Date(2026, 9, 13, 3, 0, 0, 0, time.UTC) }
 	a.newSource = func(context.Context, Config) (Source, error) { return source, nil }
+	a.targetVersions = func(context.Context, Config) (Snapshot, error) {
+		return Snapshot{ServerVersion: "8.0.1", FCV: "8.0"}, nil
+	}
 	return a, store, source, log
 }
 

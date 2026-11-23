@@ -27,6 +27,13 @@ jobs:
         run: go test -count=1 -race ./...
       - name: Verify follow-up PR selection
         run: bash tests/ci/refresh.sh
+      - name: Check Compose restore permissions
+        env:
+          MONGODB_RESTORE_ALLOW_NONEMPTY_TARGET: "true"
+          MONGODB_RESTORE_ALLOW_UNKNOWN_SOURCE_VERSION: "true"
+        run: |
+          docker compose --env-file template.env config --format json |
+            jq -e '.services.backup.environment | .MONGODB_RESTORE_ALLOW_NONEMPTY_TARGET == "true" and .MONGODB_RESTORE_ALLOW_UNKNOWN_SOURCE_VERSION == "true"'
       - name: Verify Compose examples and replica set key initialization
         run: bash tests/ci/compose.sh
       - name: Vet

@@ -240,6 +240,37 @@ func (s *mongoSource) excludedConfigCollections(ctx context.Context) ([]string, 
 	return excluded, nil
 }
 
+func targetVersions(ctx context.Context, c Config) (Snapshot, error) {
+	c.ReadPreference = "primary"
+	opts, pref, err := metadataOptions(c)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	client, err := mongo.Connect(opts)
+	if err != nil {
+		return Snapshot{}, metadataError("initialize restore connection", err)
+	}
+	s := mongoSource{client: client, pref: pref}
+	defer s.Close(context.Background())
+	if c.BackupMode == "full" {
+		if _, err := s.replicaPrimary(ctx); err != nil {
+			return Snapshot{}, fmt.Errorf("verify full restore target: %w", err)
+		}
+	}
+	if c.BackupMode == "full" && !c.AllowNonemptyFullRestore {
+		names, err := s.Databases(ctx, false, "")
+		if err != nil {
+			return Snapshot{}, fmt.Errorf("cannot verify that the restore target is empty: %w", err)
+		}
+		for _, name := range names {
+			if !systemDatabase(name) {
+				return Snapshot{}, fmt.Errorf("target contains database %q; full oplog replay can delete existing data and requires MONGODB_RESTORE_ALLOW_NONEMPTY_TARGET=true", name)
+			}
+		}
+	}
+	return s.versions(ctx, false)
+}
+
 func (s *mongoSource) versions(ctx context.Context, partial bool) (Snapshot, error) {
 	var result Snapshot
 	var build struct {

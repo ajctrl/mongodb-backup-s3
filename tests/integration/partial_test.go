@@ -78,6 +78,12 @@ func TestPartialBackupRecovery(t *testing.T) {
 	f.run(t, env, "restore", generation)
 	f.assertValue(t, target, "app", "timestamp")
 	env["BACKUP_FILENAME_MODE"] = "fixed"
+	output, err := f.runCommand(t, env, "restore", "--version-id", firstVersion)
+	if err == nil || !strings.Contains(output, "source versions unknown") {
+		t.Fatalf("unknown versions: %v: %s", err, output)
+	}
+	f.assertValue(t, target, "app", "timestamp")
+	env["MONGODB_RESTORE_ALLOW_UNKNOWN_SOURCE_VERSION"] = "true"
 	f.run(t, env, "restore", "--version-id", firstVersion)
 	f.assertValue(t, target, "app", "original")
 	f.run(t, env, "restore")

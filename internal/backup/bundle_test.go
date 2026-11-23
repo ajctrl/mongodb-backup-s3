@@ -80,7 +80,7 @@ func TestBundleChecksInventoryHashesScopeBeforeUse(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer z.Close()
-			if _, err := validateBundle(t.Context(), z, Config{BackupMode: "per-database", Database: "app"}); err == nil {
+			if _, err := validateBundle(t.Context(), &z.Reader, Config{BackupMode: "per-database", Database: "app"}); err == nil {
 				t.Fatal("invalid bundle accepted")
 			}
 		})
@@ -92,11 +92,11 @@ func TestExtractConfigPrivateAndNoOverwrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer z.Close()
-	if _, err := validateBundle(t.Context(), z, Config{BackupMode: "full"}); err != nil {
+	if _, err := validateBundle(t.Context(), &z.Reader, Config{BackupMode: "full"}); err != nil {
 		t.Fatal(err)
 	}
 	dest := filepath.Join(t.TempDir(), "extracted")
-	if err := extractConfiguration(t.Context(), z, dest); err != nil {
+	if err := extractConfiguration(t.Context(), &z.Reader, t.TempDir(), dest); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(dest, "data.archive.gz")); !os.IsNotExist(err) {
@@ -110,12 +110,12 @@ func TestExtractConfigPrivateAndNoOverwrite(t *testing.T) {
 	if info.Mode().Perm() != 0600 {
 		t.Fatal("config permissions not private")
 	}
-	if err := extractConfiguration(t.Context(), z, dest); err == nil {
+	if err := extractConfiguration(t.Context(), &z.Reader, t.TempDir(), dest); err == nil {
 		t.Fatal("existing destination overwritten")
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	if _, err := validateBundle(ctx, z, Config{BackupMode: "full"}); err == nil {
+	if _, err := validateBundle(ctx, &z.Reader, Config{BackupMode: "full"}); err == nil {
 		t.Fatal("canceled verification accepted")
 	}
 }

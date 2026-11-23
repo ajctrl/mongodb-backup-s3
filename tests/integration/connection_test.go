@@ -413,6 +413,16 @@ func TestRejectDirectShard(t *testing.T) {
 			t.Fatalf("%s backup on shard: %v\n%s", mode, err, out)
 		}
 	}
+	env := map[string]string{"S3_PREFIX": "shard-restore", "MONGODB_RESTORE_DROP": "true", "MONGODB_RESTORE_ALLOW_NONEMPTY_TARGET": "true"}
+	f.run(t, env, "backup")
+	env["MONGODB_URI"] = "mongodb://127.0.0.1:" + port + "/?replicaSet=shard&directConnection=true"
+	out, err := f.runCommand(t, env, "restore")
+	if err == nil || !strings.Contains(out, "verify full restore target") || strings.Contains(out, "Restoring users and roles") {
+		t.Fatalf("full restore wrote to shard: %v %s", err, out)
+	}
+	if err := probe("quit(db.getSiblingDB('admin').getUser('backup') === null ? 0 : 1)"); err != nil {
+		t.Fatal(err)
+	}
 
 }
 

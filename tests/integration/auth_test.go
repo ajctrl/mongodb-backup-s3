@@ -3,6 +3,8 @@
 package integration_test
 
 import (
+	"bytes"
+	"strings"
 	"testing"
 	"time"
 
@@ -41,6 +43,23 @@ func TestAuthRestoreFreshDestination(t *testing.T) {
 	f.run(t, env, "backup")
 	env["MONGODB_URI"] = f.targetURI
 	env["MONGODB_RESTORE_DROP"] = "true"
+	// Refusing a version preflight must precede even the first user restore.
+	admin := target.Database("admin")
+	var before bson.Raw
+	filter := bson.M{"user": "root", "db": "admin"}
+	if err := admin.Collection("system.users").FindOne(ctx, filter).Decode(&before); err != nil {
+		t.Fatal(err)
+	}
+	f.command(t, admin, bson.D{{Key: "configureFailPoint", Value: "failCommand"}, {Key: "mode", Value: "alwaysOn"}, {Key: "data", Value: bson.M{"failCommands": bson.A{"getParameter"}, "appName": "mongodb-backup-s3", "errorCode": 13}}})
+	output, err := f.runCommand(t, env, "restore-auth")
+	f.command(t, admin, bson.D{{Key: "configureFailPoint", Value: "failCommand"}, {Key: "mode", Value: "off"}})
+	if err == nil || !strings.Contains(output, "inspect destructive restore target") {
+		t.Fatalf("version preflight: %v: %s", err, output)
+	}
+	var after bson.Raw
+	if err := admin.Collection("system.users").FindOne(ctx, filter).Decode(&after); err != nil || !bytes.Equal(before, after) {
+		t.Fatal("destination credentials changed on refused restore")
+	}
 	f.run(t, env, "restore-auth")
 	target = f.connect(t, f.targetURI)
 	audit = target.Database("admin").Collection("audit")

@@ -12,6 +12,7 @@ require (
 	github.com/robfig/cron/v3 v3.0.1
 	go.mongodb.org/mongo-driver/v2 v2.3.1
 	golang.org/x/mod v0.43.0
+	golang.org/x/sys v0.49.0
 )
 
 require (

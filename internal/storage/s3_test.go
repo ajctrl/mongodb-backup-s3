@@ -75,6 +75,16 @@ func writeS3Error(w http.ResponseWriter, status int, code string) {
 	fmt.Fprintf(w, "<Error><Code>%s</Code><Message>test failure</Message></Error>", code)
 }
 
+func downloadTarget(t *testing.T) *os.File {
+	t.Helper()
+	f, err := os.CreateTemp(t.TempDir(), "download-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { f.Close() })
+	return f
+}
+
 func TestS3SignedRequestsAndFileRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	key := "/backup//odd%2Fdatabase_2026-09-12T11:20:30.dump"
@@ -142,15 +152,15 @@ func TestS3SignedRequestsAndFileRoundTrip(t *testing.T) {
 	if uploaded.Load() == nil || !bytes.Equal(uploaded.Load().([]byte), payload) {
 		t.Fatalf("uploaded body differs: %q", uploaded.Load())
 	}
-	destination := filepath.Join(t.TempDir(), "restored.dump")
+	destination := downloadTarget(t)
 	if err := s.Download(ctx, key, versionID, destination); err != nil {
 		t.Fatal(err)
 	}
-	downloaded, err := os.ReadFile(destination)
+	downloaded, err := io.ReadAll(destination)
 	if err != nil || !bytes.Equal(downloaded, payload) {
 		t.Fatalf("download = %q, %v", downloaded, err)
 	}
-	info, err := os.Stat(destination)
+	info, err := destination.Stat()
 	if err != nil || info.Mode().Perm() != 0600 {
 		t.Fatalf("download permissions = %v, %v", info, err)
 	}
@@ -390,23 +400,14 @@ func TestS3CanceledMultipartUploadIsAborted(t *testing.T) {
 	}
 }
 
-func TestS3FailedDownloadKeepsDestination(t *testing.T) {
+func TestS3MissingDownloadFails(t *testing.T) {
 	s := testS3(t, func(w http.ResponseWriter, r *http.Request) {
 		writeS3Error(w, http.StatusNotFound, "NoSuchKey")
 	})
-	dir := t.TempDir()
-	path := filepath.Join(dir, "existing.dump")
-	if err := os.WriteFile(path, []byte("existing"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.Download(context.Background(), "missing.dump", "", path); err == nil {
+	if err := s.Download(t.Context(), "missing.dump", "", downloadTarget(t)); err == nil {
 		t.Fatal("missing object download succeeded")
 	}
-	body, _ := os.ReadFile(path)
-	entries, _ := os.ReadDir(dir)
-	if string(body) != "existing" || len(entries) != 1 {
-		t.Fatalf("failed download changed destination or left temporary files: body = %q, entries = %v", body, entries)
-	}
+
 }
 
 func TestS3MultipartDownloadPinsObject(t *testing.T) {
@@ -436,11 +437,11 @@ func TestS3MultipartDownloadPinsObject(t *testing.T) {
 				w.WriteHeader(http.StatusPartialContent)
 				w.Write(payload[start : end+1])
 			})
-			path := filepath.Join(t.TempDir(), "large.dump")
+			path := downloadTarget(t)
 			if err := s.Download(context.Background(), "latest.dump", versionID, path); err != nil {
 				t.Fatal(err)
 			}
-			body, err := os.ReadFile(path)
+			body, err := io.ReadAll(path)
 			if err != nil || !bytes.Equal(body, payload) || requests.Load() != 3 {
 				t.Fatalf("multipart download: err = %v, requests = %d, bytes = %d", err, requests.Load(), len(body))
 			}
@@ -523,7 +524,7 @@ func TestS3DisabledVersioningAndCancellation(t *testing.T) {
 	for name, operation := range map[string]func() error{
 		"versioning": func() error { _, err := s.VersioningEnabled(ctx); return err },
 		"upload":     func() error { return s.Upload(ctx, "key", io.NopCloser(strings.NewReader("unused")), false) },
-		"download":   func() error { return s.Download(ctx, "key", "", "missing") },
+		"download":   func() error { return s.Download(ctx, "key", "", nil) },
 		"list":       func() error { _, err := s.List(ctx, ""); return err },
 		"delete":     func() error { return s.Delete(ctx, "key") },
 	} {

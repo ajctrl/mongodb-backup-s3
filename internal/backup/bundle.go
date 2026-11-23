@@ -18,6 +18,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"golang.org/x/sys/unix"
 )
 
 type FileRecord struct {
@@ -205,7 +207,7 @@ func allowedMember(name string) bool {
 
 // validateBundle reads every member to EOF (ZIP CRC + manifest SHA-256) before
 // any database import, including components the selected operation won't use.
-func validateBundle(ctx context.Context, z *zip.ReadCloser, c Config) (Manifest, error) {
+func validateBundle(ctx context.Context, z *zip.Reader, c Config) (Manifest, error) {
 	var m Manifest
 	files := map[string]*zip.File{}
 	for _, f := range z.File {
@@ -295,7 +297,7 @@ func (r contextReader) Read(p []byte) (int, error) {
 	return r.r.Read(p)
 }
 
-func zipMember(z *zip.ReadCloser, name string) (*zip.File, error) {
+func zipMember(z *zip.Reader, name string) (*zip.File, error) {
 	for _, f := range z.File {
 		if f.Name == name {
 			return f, nil
@@ -317,20 +319,23 @@ func copyMember(ctx context.Context, f *zip.File, dest string) error {
 	return errors.Join(err, w.Close())
 }
 
-func extractConfiguration(ctx context.Context, z *zip.ReadCloser, dest string) (err error) {
-	dest, err = filepath.Abs(dest)
-	if err != nil {
-		return err
-	}
-	if _, err = os.Lstat(dest); !os.IsNotExist(err) {
+func checkConfigDestination(dest string) error {
+	if _, err := os.Lstat(dest); err == nil {
 		return fmt.Errorf("configuration output directory must not already exist")
+	} else if !os.IsNotExist(err) {
+		return err
 	}
-	// Stage next to the destination, then rename so failed extraction is not exposed.
-	dir, err := os.MkdirTemp(filepath.Dir(dest), ".mongodb-config-")
+	parent, err := os.Stat(filepath.Dir(dest))
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(dir)
+	if !parent.IsDir() {
+		return fmt.Errorf("configuration output parent must be a directory")
+	}
+	return nil
+}
+
+func extractConfiguration(ctx context.Context, z *zip.Reader, dir, dest string) error {
 	for _, f := range z.File {
 		if f.Name != "manifest.json" && f.Name != "replica-set.json" && !strings.HasPrefix(f.Name, "config/") {
 			continue
@@ -349,5 +354,6 @@ func extractConfiguration(ctx context.Context, z *zip.ReadCloser, dest string) (
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return os.Rename(dir, dest)
+	// Never replace a destination created after the preflight.
+	return unix.Renameat2(unix.AT_FDCWD, dir, unix.AT_FDCWD, dest, unix.RENAME_NOREPLACE)
 }

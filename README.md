@@ -385,13 +385,13 @@ and change the MongoDB URI to the **restore target**.
 In fixed mode, an argument-free restore now selects the newest S3 `LastModified` across the fixed key and timestamped objects
 in the same mode, database and encryption format. It requires permission to list that prefix. Ties use the manifest completion time.
 Use `--version-id` with an immutable S3 ID for a specific fixed version (the mutable ID `null` is rejected), or set `BACKUP_FILENAME_MODE=timestamp` and use the logged generation name for an exact timestamped backup. Keep your usual restore image, network, and mounts. For a per-database restore, select that database in `restore.env`.
-The target should normally be an already provisioned, empty environment.
+Use a provisioned, quiescent restore target. Full restore checks the primary for existing application databases before importing. Without explicit permission, a failed inventory check or any database outside `admin`, `config`, and `local` stops the restore. Keep other writers and administrators off the target through completion, since the check and import are separate operations.
 A restore is not a transaction that rolls back on failure; partially written data remains if it fails.
 
 The entire S3 object is downloaded, decrypted, and checked for ZIP, manifest, and hash validity before import starts.
 Archives are read from the validated ZIP and streamed to `mongorestore` through standard input.
 Temporary disk space must accommodate one bundle without encryption, or both the encrypted and decrypted bundles with encryption.
-When the latest S3 timestamp is tied, selection can temporarily retain two such bundles while comparing candidates.
+The downloader and GPG each write to a file that has already been unlinked. The operating system releases the downloaded and decrypted data when their descriptors close, including after a forced exit. Tied timestamps can retain two plaintext bundles plus the encrypted candidate during comparison.
 No additional space is needed to extract the import archive as a separate file.
 Provide enough space through `TMPDIR` or a disk mounted at `/tmp`.
 Restore time also includes index rebuilding and oplog replay after import.
@@ -410,12 +410,21 @@ docker run --rm --env-file restore.env -e BACKUP_FILENAME_MODE=fixed \
 ```
 
 For `full` restores, clear all database selection variables or set them to false as appropriate.
-All data, users, and roles are restored, and the oplog is always replayed. Partial restores and database renaming are not supported.
-For `per-database` restores, select one database, such as `MONGODB_DATABASE=app`, and clear the other selection variables.
+MongoDB Tools restores the logical dump, including users and roles, and replays the captured oplog.
+The dump excludes the `local` database and includes only the supported collections in `config`. Partial restores and database renaming are not supported.
+For `per-database` and `partial` restores, select one database, such as `MONGODB_DATABASE=app`, and clear the other selection variables.
 Only data is restored to the original database name; authentication information is not changed automatically.
 
 Normal restores use `--stopOnError`. `MONGODB_RESTORE_DROP=true` drops existing collections included in the dump before restoring them.
-Collections absent from the dump are not dropped.
+Every full restore replays oplog operations, including deletes and database drops, even with `MONGODB_RESTORE_DROP=false`. These can remove collections unique to the target. To allow a full restore onto an existing application database, set `MONGODB_RESTORE_ALLOW_NONEMPTY_TARGET=true`. This permission is independent of `MONGODB_RESTORE_DROP`. Full restore can also change users, roles, and system data on a freshly provisioned target.
+
+Restore reports the failing import stage and tool exit status. Both output streams from `mongorestore` are suppressed because errors can include document contents.
+
+Before the first write in every full restore or dropping restore, the tool reads the target primary's Server version and FCV.
+The source and target must have matching major.minor release series and FCV. Patch versions may differ. A detected FCV transition stops backup publication or destructive restore.
+Full restore also verifies the writable primary and ordinary replica set role with `hello` and `getCmdLineOpts` before importing users or data. The restore account needs permission to run `buildInfo` and `getParameter` for version checks and `getCmdLineOpts` for the full restore topology check.
+A partial bundle with unknown source versions requires `MONGODB_RESTORE_ALLOW_UNKNOWN_SOURCE_VERSION=true` for a dropping restore.
+The override permits missing fields. Every available source version field must still match the target. Failed target version checks still stop the restore. The full restore account also needs cluster-wide `listDatabases` for the default target inventory check.
 Restoring the admin database with `--drop` also replaces user information, so credentials from the backup are required afterward.
 When `MONGODB_RESTORE_DROP=true` is used with a `full` restore or `restore-auth`, users and roles are restored first,
 then the remaining restore uses a new connection. This prevents invalidated authenticated connections from interrupting oplog replay
@@ -453,8 +462,8 @@ docker run --rm --env-file restore.env -e MONGODB_URI= -e MONGODB_URI_FILE= \
   ghcr.io/ajctrl/mongodb-backup-s3:latest mongodb-backup-s3 extract-config /recovered/generation
 ```
 
-`extract-config OUTPUT_DIR [GENERATION | --version-id VERSION_ID]` extracts `replica-set.json`, `manifest.json`, and `config/`
-without connecting to MongoDB. It rejects an output directory that already exists.
+`extract-config OUTPUT_DIR [GENERATION | --version-id VERSION_ID]` extracts `manifest.json` and the available `replica-set.json` and `config/` entries
+without connecting to MongoDB. Before downloading, it creates a private staging directory in the writable output parent. Publication requires the destination name to be unused.
 Even when extracting only configuration, it downloads and decrypts the entire bundle and validates every entry before extraction.
 Hashes detect changes or corruption. Hashes in an unencrypted ZIP are not signatures proving the source's authenticity.
 
@@ -473,7 +482,9 @@ Original ownership and permissions are not restored automatically; adjust them w
 | `MONGODB_PARALLEL_COLLECTIONS` | `4` | Dump concurrency and requested restore concurrency; 1–128. During restore, MongoDB Tools may increase this to consume the archive's multiplexed streams; this is not a restore concurrency cap. |
 | `MONGODB_CONFIG_DIR` | Empty | Directory containing configuration files to back up |
 | `MONGODB_RESTORE_DROP` | `false` | Drop target collections before restoring |
-| `BACKUP_MODE` | `full` | `full` / `per-database` |
+| `MONGODB_RESTORE_ALLOW_NONEMPTY_TARGET` | `false` | Allow full oplog replay onto a target with existing application databases. |
+| `MONGODB_RESTORE_ALLOW_UNKNOWN_SOURCE_VERSION` | `false` | Permit a dropping restore of a partial backup with missing source Server/FCV metadata. |
+| `BACKUP_MODE` | `full` | `full` / `per-database` for backup. Use `partial` to restore or extract configuration from an automatic partial backup. |
 | `MONGODB_DATABASE` | Empty | Single database selection or per-database restore target |
 | `MONGODB_DATABASES` | Empty | JSON array of exact database names to back up; `[]` means no entries |
 | `MONGODB_BACKUP_ALL` | `false` | Automatically discover application databases |

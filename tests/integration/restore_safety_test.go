@@ -6,7 +6,11 @@ import (
 	"bufio"
 	"bytes"
 	"io"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -51,7 +55,7 @@ func TestRestoreWriteConcernAndEncodedKeys(t *testing.T) {
 	t.Run("acknowledged_writes_report_server_rejection", func(t *testing.T) {
 		env["MONGODB_URI"] = f.targetURI + "&w=1"
 		output, err := f.runCommand(t, env, "restore")
-		if err == nil || !strings.Contains(output, "Document failed validation") || strings.Contains(output, "Restore complete.") {
+		if err == nil || !strings.Contains(output, "apply data.archive.gz: mongorestore failed: exit status") || strings.Contains(output, "Document failed validation") || strings.Contains(output, "Restore complete.") {
 			t.Fatalf("server validation failure was not reported: %v\n%s", err, output)
 		}
 		if n, err := target.Database("app").Collection("probe").CountDocuments(ctx, bson.M{}); err != nil || n != 0 {
@@ -63,7 +67,7 @@ func TestRestoreWriteConcernAndEncodedKeys(t *testing.T) {
 		env["MONGODB_RESTORE_DROP"] = "true"
 		env["MONGODB_PARALLEL_COLLECTIONS"] = "1"
 		output, err := f.runCommand(t, env, "restore")
-		if err != nil || !strings.Contains(output, "Restore complete.") || !strings.Contains(output, "setting number of parallel collections to 4") {
+		if err != nil || !strings.Contains(output, "Restore complete.") {
 			t.Fatalf("archive concurrency adjustment/restore failed: %v\n%s", err, output)
 		}
 		for _, collection := range []string{"probe", "second", "third", "fourth"} {
@@ -73,6 +77,41 @@ func TestRestoreWriteConcernAndEncodedKeys(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestFCVTransitionRefusesBackupAndDestructiveRestore(t *testing.T) {
+	ctx, cancel := fixtureContext(t, 2*time.Minute)
+	defer cancel()
+	f := newFixture(t, ctx)
+	src := f.connect(t, f.sourceURI)
+	f.seed(t, src)
+	f.command(t, src.Database("admin"), bson.D{{Key: "setFeatureCompatibilityVersion", Value: "7.0"}, {Key: "confirm", Value: true}})
+	env := map[string]string{"BACKUP_MODE": "per-database", "MONGODB_DATABASE": "app", "S3_PREFIX": "fcv"}
+	f.run(t, env, "backup")
+	dst := f.connect(t, f.targetURI)
+	if _, err := dst.Database("app").Collection("probe").InsertOne(ctx, bson.M{"_id": 1, "value": "keep"}); err != nil {
+		t.Fatal(err)
+	}
+	admin := dst.Database("admin")
+	f.command(t, admin, bson.D{{Key: "configureFailPoint", Value: "failAfterReachingTransitioningState"}, {Key: "mode", Value: "alwaysOn"}})
+	err := admin.RunCommand(ctx, bson.D{{Key: "setFeatureCompatibilityVersion", Value: "7.0"}, {Key: "confirm", Value: true}}).Err()
+	if err == nil {
+		t.Fatal("expected interrupted transition")
+	}
+	f.command(t, admin, bson.D{{Key: "configureFailPoint", Value: "failAfterReachingTransitioningState"}, {Key: "mode", Value: "off"}})
+	env["MONGODB_URI"], env["MONGODB_RESTORE_DROP"] = f.targetURI, "true"
+	out, err := f.runCommand(t, env, "restore")
+	if err == nil || !strings.Contains(out, "feature compatibility version transition") {
+		t.Fatalf("restore during FCV transition: %v %s", err, out)
+	}
+	if count, err := dst.Database("app").Collection("probe").CountDocuments(ctx, bson.M{"_id": 1, "value": "keep"}); err != nil || count != 1 {
+		t.Fatalf("target sentinel after refused restore: count=%d, err=%v", count, err)
+	}
+	env["S3_PREFIX"] = "transition-source"
+	out, err = f.runCommand(t, env, "backup")
+	if err == nil || !strings.Contains(out, "feature compatibility version transition") || len(f.keys(t, "transition-source/")) != 0 {
+		t.Fatalf("backup during FCV transition: %v %s", err, out)
+	}
 }
 
 func TestFixedBackupPreservesMutableNullVersion(t *testing.T) {
@@ -143,6 +182,52 @@ func TestFixedBackupPreservesMutableNullVersion(t *testing.T) {
 	f.assertValue(t, f.connect(t, f.targetURI), "app", "original")
 	if out, err := f.runCommand(t, env, "restore", "--version-id", "null"); err == nil || !strings.Contains(out, "mutable") || strings.Contains(out, "Downloading") {
 		t.Fatalf("null version preflight: %v %s", err, out)
+	}
+}
+
+func TestEncryptedRestoreLeavesNoPlaintextAfterKill(t *testing.T) {
+	if os.Getenv("MONGODB_NATIVE_INTEGRATION") == "1" {
+		t.Skip("uses a mounted container TMPDIR")
+	}
+	ctx, cancel := fixtureContext(t, 2*time.Minute)
+	defer cancel()
+	f := newFixture(t, ctx)
+	f.seed(t, f.connect(t, f.sourceURI))
+	env := map[string]string{"BACKUP_MODE": "per-database", "MONGODB_DATABASE": "app", "S3_PREFIX": "interrupted", "PASSPHRASE": "fixture", "TMPDIR": "/output"}
+	f.run(t, env, "backup")
+	env["MONGODB_URI"] = f.targetURI
+	f.command(t, f.connect(t, f.targetURI).Database("admin"), bson.D{
+		{Key: "configureFailPoint", Value: "failCommand"}, {Key: "mode", Value: bson.M{"times": 1}}, {Key: "data", Value: bson.M{"failCommands": bson.A{"insert"}, "blockConnection": true, "blockTimeMS": 5000}},
+	})
+	cmd, signal := f.backupCommand(t, env, "restore")
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	scanner := bufio.NewScanner(out)
+	interrupted := false
+	for scanner.Scan() {
+		if strings.Contains(scanner.Text(), "Restoring backup created") {
+			if err := signal(syscall.SIGKILL); err != nil {
+				t.Fatal(err)
+			}
+			interrupted = true
+			break
+		}
+	}
+	if err := cmd.Wait(); err == nil || !interrupted {
+		t.Fatalf("restore was not interrupted: %v", err)
+	}
+	if err := filepath.WalkDir(f.outputDir, func(path string, d fs.DirEntry, err error) error {
+		if err == nil && d.Type().IsRegular() {
+			t.Errorf("unexpected file in mounted TMPDIR: %s", path)
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 
