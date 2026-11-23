@@ -172,7 +172,7 @@ func (f *fixture) addSecondary(t *testing.T) {
 		if f.tlsConfig != nil {
 			args = append(args, "--mount", "type=bind,source="+f.configDir+",target=/test-tls,readonly")
 		}
-		args = append(args, "--entrypoint", "bash", envOr("MONGODB_TEST_IMAGE", "mongo:8.0"), "-c",
+		args = append(args, "--entrypoint", "bash", envOr("MONGODB_TEST_IMAGE", defaultMongoTestImage), "-c",
 			"set -eu; printf '%s' "+testReplicaKey+" >/tmp/test-key; chmod 600 /tmp/test-key; chown mongodb:mongodb /tmp/test-key; "+f.copyTLSCommand()+
 				"exec docker-entrypoint.sh mongod --bind_ip_all --port "+f.secondaryPort+" --replSet source --keyFile /tmp/test-key --oplogSize 128 "+strings.Join(f.mongoTLSArgs("/tmp"), " "))
 		docker(t, f.ctx, args...)

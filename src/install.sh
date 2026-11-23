@@ -13,7 +13,9 @@ case "${TARGETARCH:-$(dpkg --print-architecture)}" in
 esac
 
 tools_version=${MONGODB_TOOLS_VERSION:-100.19.1}
-tools_name="mongodb-database-tools-ubuntu2404-${tools_arch}-${tools_version}"
+. /etc/os-release
+ubuntu_release=$(printf '%s' "$VERSION_ID" | tr -d '.')
+tools_name="mongodb-database-tools-ubuntu${ubuntu_release}-${tools_arch}-${tools_version}"
 tools_dir=$(mktemp -d)
 trap 'rm -rf "$tools_dir"' EXIT HUP INT TERM
 curl --fail --show-error --silent --location --retry 3 \

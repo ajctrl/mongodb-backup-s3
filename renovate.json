@@ -1,0 +1,88 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "automerge": true,
+  "platformAutomerge": true,
+  "rebaseWhen": "behind-base-branch",
+  "postUpdateOptions": ["gomodTidy", "gomodUpdateImportPaths"],
+  "packageRules": [
+    {
+      "matchManagers": ["gomod"],
+      "matchDepTypes": ["indirect"],
+      "enabled": true
+    },
+    {
+      "matchManagers": ["gomod"],
+      "matchDepTypes": ["golang"],
+      "rangeStrategy": "bump"
+    },
+    {
+      "description": "The custom manager updates GO_VERSION inside the interpolated Alpine tag",
+      "matchManagers": ["dockerfile"],
+      "matchDepNames": ["golang"],
+      "enabled": false
+    },
+    {
+      "matchDepNames": ["go", "golang"],
+      "groupName": "Go toolchain"
+    },
+    {
+      "matchDatasources": ["docker"],
+      "matchDepNames": ["mongo"],
+      "groupName": "MongoDB development and test images"
+    },
+    {
+      "matchPackageNames": ["github.com/aws/aws-sdk-go-v2", "github.com/aws/aws-sdk-go-v2/**", "github.com/aws/smithy-go"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "AWS SDK for Go"
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/workflows/verify\\.yml$/"],
+      "matchStrings": ["REGCTL_VERSION: (?<currentValue>v[0-9.]+)"],
+      "datasourceTemplate": "github-releases",
+      "depNameTemplate": "regclient/regclient"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/^Dockerfile$/"],
+      "matchStrings": ["ARG GO_VERSION=(?<currentValue>[0-9.]+)"],
+      "datasourceTemplate": "docker",
+      "depNameTemplate": "golang",
+      "extractVersionTemplate": "^(?<version>[0-9]+[.][0-9]+)-alpine$",
+      "versioningTemplate": "docker"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/^Dockerfile$/", "/^README\\.md$/", "/^src\\/install\\.sh$/"],
+      "matchStrings": [
+        "ARG MONGODB_TOOLS_VERSION=(?<currentValue>[\\d.]+)",
+        "MONGODB_TOOLS_VERSION:-(?<currentValue>[\\d.]+)",
+        "from MongoDB Database Tools \\*\\*(?<currentValue>[\\d.]+)\\*\\*"
+      ],
+      "datasourceTemplate": "github-tags",
+      "depNameTemplate": "mongodb/mongo-tools",
+      "versioningTemplate": "semver"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/^tests\\/integration\\/docker_test\\.go$/", "/^README\\.md$/"],
+      "matchStrings": [
+        "defaultMongoTestImage\\s*=\\s*\"mongo:(?<currentValue>[\\d.]+)\"",
+        "Integration tests target MongoDB (?<currentValue>\\d+\\.\\d+\\.\\d+)\\."
+      ],
+      "datasourceTemplate": "docker",
+      "depNameTemplate": "mongo",
+      "versioningTemplate": "docker"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/^tests\\/integration\\/docker_test\\.go$/"],
+      "matchStrings": ["docker.io/pgsty/silo:(?<currentValue>RELEASE\\.[\\dTZ-]+-distroless)@(?<currentDigest>sha256:[a-f0-9]{64})"],
+      "datasourceTemplate": "docker",
+      "depNameTemplate": "pgsty/silo",
+      "versioningTemplate": "regex:^RELEASE\\.(?<major>\\d{4})-(?<minor>\\d{2})-(?<patch>\\d{2})T(?<build>\\d{2})-(?<revision>\\d{2})-\\d{2}Z-distroless$"
+    }
+  ]
+}

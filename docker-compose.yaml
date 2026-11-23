@@ -24,7 +24,7 @@ services:
         chmod 444 /bootstrap/mongod.conf
 
   mongodb:
-    image: mongo:8.0
+    image: mongo:8.0.38
     depends_on:
       config-init:
         condition: service_completed_successfully
@@ -48,7 +48,7 @@ services:
       retries: 60
 
   replica-init:
-    image: mongo:8.0
+    image: mongo:8.0.38
     depends_on:
       mongodb:
         condition: service_healthy

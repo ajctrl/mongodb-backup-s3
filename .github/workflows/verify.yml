@@ -1,0 +1,199 @@
+name: Verify and publish tested images
+
+on:
+  push:
+    branches-ignore: ["renovate/**"]
+    tags: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  REGCTL_VERSION: v0.11.7
+
+jobs:
+  unit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+      - name: Test with race detector
+        run: go test -count=1 -race ./...
+      - name: Verify follow-up PR selection
+        run: bash tests/ci/refresh.sh
+      - name: Vet
+        run: go vet ./...
+      - name: Check formatting
+        shell: bash
+        run: test -z "$(gofmt -l cmd internal tests)"
+
+  publication-test:
+    runs-on: ubuntu-24.04
+    services:
+      registry:
+        image: registry:3
+        ports:
+          - 5000/tcp
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v4
+        with:
+          driver: docker-container
+      - uses: regclient/actions/regctl-installer@v0.2.0
+        with:
+          release: ${{ env.REGCTL_VERSION }}
+      - name: Verify retry and out-of-order publication
+        env:
+          REGISTRY_PORT: ${{ job.services.registry.ports['5000'] }}
+        run: bash tests/ci/publication.sh "127.0.0.1:$REGISTRY_PORT"
+
+  integration:
+    name: Integration (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+      - uses: docker/setup-docker-action@v5
+        with:
+          daemon-config: '{"features":{"containerd-snapshotter":true}}'
+      - uses: docker/setup-buildx-action@v4
+        with:
+          driver: docker-container
+      - name: Build and load native image for testing
+        env:
+          PROVENANCE_MODE: ${{ github.event.repository.private && 'min' || 'max' }}
+        run: |
+          archive="$RUNNER_TEMP/image-${{ matrix.arch }}.tar"
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:sha-$GITHUB_SHA"
+          docker buildx build --platform linux/${{ matrix.arch }} --provenance="mode=$PROVENANCE_MODE" \
+            --tag "$image" --output "type=oci,dest=$archive" \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" .
+          docker load --input "$archive"
+          docker tag "$image" mongodb-backup-s3:integration
+          expected=$(tar -xOf "$archive" index.json | jq -er '.manifests | select(length == 1) | .[0].digest')
+          test "$(docker image inspect --format '{{.Descriptor.Digest}}' mongodb-backup-s3:integration)" = "$expected"
+      - name: Prepare previous Database Tools for compatibility test
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          previous=$(git show "$BASE_SHA:Dockerfile" | sed -n 's/^ARG MONGODB_TOOLS_VERSION=//p')
+          current=$(sed -n 's/^ARG MONGODB_TOOLS_VERSION=//p' Dockerfile)
+          [[ "$previous" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$current" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          if [[ "$previous" != "$current" ]]; then
+            docker buildx build --load --provenance=false --build-arg "MONGODB_TOOLS_VERSION=$previous" -t mongodb-backup-s3:previous-tools .
+            docker run --rm mongodb-backup-s3:previous-tools mongodump --version | grep -Fx "mongodump version: $previous"
+            docker run --rm mongodb-backup-s3:integration mongorestore --version | grep -Fx "mongorestore version: $current"
+            echo "PREVIOUS_TOOLS_IMAGE=mongodb-backup-s3:previous-tools" >> "$GITHUB_ENV"
+          fi
+      - name: MongoDB replica set and S3 round trips
+        env:
+          BACKUP_TEST_IMAGE: mongodb-backup-s3:integration
+        run: go test -count=1 -tags=integration -v -timeout=20m ./tests/integration
+      - uses: actions/upload-artifact@v7
+        if: github.ref == 'refs/heads/main' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
+        with:
+          name: image-${{ matrix.arch }}
+          path: ${{ runner.temp }}/image-${{ matrix.arch }}.tar
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 2
+
+  publish:
+    needs: [unit, integration, publication-test]
+    if: github.ref == 'refs/heads/main' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    concurrency:
+      group: publish-image-${{ github.sha }}
+      queue: max
+    outputs:
+      digest: ${{ steps.publish.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: regclient/actions/regctl-installer@v0.2.0
+        with:
+          release: ${{ env.REGCTL_VERSION }}
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - uses: docker/login-action@v4
+        if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != ''
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ env.DOCKERHUB_TOKEN }}
+      - id: canonical
+        run: bash .github/scripts/publish-image.sh lookup
+      - uses: actions/download-artifact@v8
+        if: steps.canonical.outputs.digest == ''
+        with:
+          pattern: image-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/tested
+      - id: publish
+        env:
+          MIRROR_USER: ${{ secrets.DOCKERHUB_TOKEN != '' && secrets.DOCKERHUB_USERNAME || '' }}
+        run: bash .github/scripts/publish-image.sh publish
+
+  latest:
+    needs: publish
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    concurrency:
+      group: publish-image-latest
+      queue: max
+    steps:
+      - uses: actions/checkout@v6
+      - uses: regclient/actions/regctl-installer@v0.2.0
+        with:
+          release: ${{ env.REGCTL_VERSION }}
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - uses: docker/login-action@v4
+        if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != ''
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ env.DOCKERHUB_TOKEN }}
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE_DIGEST: ${{ needs.publish.outputs.digest }}
+          MIRROR_USER: ${{ secrets.DOCKERHUB_TOKEN != '' && secrets.DOCKERHUB_USERNAME || '' }}
+        run: bash .github/scripts/publish-image.sh latest

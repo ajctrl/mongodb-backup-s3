@@ -37,10 +37,11 @@ import (
 )
 
 const (
-	defaultS3TestImage = "docker.io/pgsty/silo:RELEASE.2026-10-18T00-00-00Z-distroless@sha256:472f59c7be537571f0f9a2ee6b8fe033a220939d521255bd4bf5339e53db7218"
-	testPassword       = "integration-password"
-	testReplicaKey     = "aW50ZWdyYXRpb24tb25seS1yZXBsaWNhLWtleQ=="
-	testConfig         = "replication:\n  replSetName: source\nsecurity:\n  authorization: enabled\n"
+	defaultMongoTestImage = "mongo:8.0.38"
+	defaultS3TestImage    = "docker.io/pgsty/silo:RELEASE.2026-10-18T00-00-00Z-distroless@sha256:472f59c7be537571f0f9a2ee6b8fe033a220939d521255bd4bf5339e53db7218"
+	testPassword          = "integration-password"
+	testReplicaKey        = "aW50ZWdyYXRpb24tb25seS1yZXBsaWNhLWtleQ=="
+	testConfig            = "replication:\n  replSetName: source\nsecurity:\n  authorization: enabled\n"
 )
 
 // TestBackupRestore creates disposable authenticated source and destination
@@ -55,6 +56,28 @@ func TestBackupRestore(t *testing.T) {
 	f := newFixture(t, ctx)
 	source := f.connect(t, f.sourceURI)
 	f.seed(t, source)
+
+	if previous := os.Getenv("PREVIOUS_TOOLS_IMAGE"); previous != "" {
+		t.Run("restore_previous_tools_backup", func(t *testing.T) {
+			if f.native {
+				t.Fatal("PREVIOUS_TOOLS_IMAGE requires Docker integration mode")
+			}
+			env := map[string]string{"S3_PREFIX": "previous-tools", "BACKUP_FILENAME_MODE": "fixed"}
+			writer := *f
+			writer.name += "-previous-tools"
+			writer.image = previous
+			writer.run(t, env, "backup")
+
+			env["MONGODB_URI"] = f.targetURI
+			env["MONGODB_RESTORE_DROP"] = "true"
+			f.run(t, env, "restore")
+			target := f.connect(t, f.targetURI)
+			f.assertValue(t, target, "app", "original")
+			f.assertValue(t, target, "analytics", "analytics original")
+			f.assertIndex(t, target)
+			f.assertAuth(t, "app", "appreader")
+		})
+	}
 
 	t.Run("conditional_writes_preserve_existing_generation", func(t *testing.T) {
 		store, err := storage.New(ctx, storage.Config{Bucket: f.bucket, Region: "us-east-1", Endpoint: f.endpoint,
@@ -404,9 +427,15 @@ func newFixtureWithOptions(t *testing.T, ctx context.Context, opts fixtureOption
 		docker(t, ctx, "image", "inspect", f.image)
 		f.anchor = f.name + "-source"
 		for _, name := range []string{f.anchor, f.name + "-destination", f.name + "-s3"} {
-			t.Cleanup(func() { dockerCleanup(t, "rm", "-f", "-v", name) })
+			t.Cleanup(func() {
+				if t.Failed() {
+					logs, _ := exec.Command("docker", "logs", "--tail", "40", name).CombinedOutput()
+					t.Logf("%s startup diagnostics: %s", name, logs)
+				}
+				dockerCleanup(t, "rm", "-f", "-v", name)
+			})
 		}
-		mongoImage := envOr("MONGODB_TEST_IMAGE", "mongo:8.0")
+		mongoImage := envOr("MONGODB_TEST_IMAGE", defaultMongoTestImage)
 		startMongo := func(name, port, set string, networkArgs []string) {
 			args := append([]string{"run", "-d", "--name", name}, networkArgs...)
 			args = append(args, "-e", "MONGO_INITDB_ROOT_USERNAME=root", "-e", "MONGO_INITDB_ROOT_PASSWORD="+testPassword)

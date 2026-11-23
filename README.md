@@ -17,7 +17,7 @@ Designed for self-managed replica sets. Sharded clusters, standalone servers, an
 ## Usage
 
 Supports Linux amd64 / arm64 and includes `mongodump` and `mongorestore` from MongoDB Database Tools **100.19.1**.
-Integration tests target MongoDB 8.0. Verify restores with the same Server / FCV / Tools combination used in production.
+Integration tests target MongoDB 8.0.38. Verify restores with the same Server / FCV / Tools combination used in production.
 
 The image uses a custom distroless runtime built from `scratch`, with MongoDB Tools, GPG,
 their matching Ubuntu libraries, CA certificates, and timezone data. It contains no shell or package manager.
@@ -479,9 +479,7 @@ Timeout tests run both installed tools against an unresponsive TCP endpoint and 
 server-selection and connection timeouts. In Docker mode these tests use the host network on Linux.
 Shutdown checks require the expected exit code, no completed partial backup, aborted uploaded parts,
 and released locks. Only disposable test MongoDB instances enable failpoints to hold an active dump.
-The default S3 server is the digest-pinned
-[`pgsty/silo:RELEASE.2026-10-18T00-00-00Z-distroless`](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-10-18T00-00-00Z)
-image. It starts the server directly and does not require a shell or client tools inside the container.
+The default S3 server is the digest-pinned [Silo distroless image](tests/integration/docker_test.go). It starts the server directly and does not require a shell or client tools inside the container.
 Silo uses `MINIO_ROOT_USER` and `MINIO_ROOT_PASSWORD` for its root credentials.
 Override `MONGODB_TEST_IMAGE`, `BACKUP_TEST_IMAGE`, or `S3_TEST_IMAGE` to test another image;
 an S3 image override must accept the same server arguments and credential variables.
