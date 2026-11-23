@@ -7,8 +7,9 @@ Original licenses and attribution are preserved in `LICENSE` and `LICENSE.txt`.
 
 | `BACKUP_MODE` | Backup unit | Writes during backup |
 | --- | --- | --- |
-| `full` (default) | One object for the entire replica set | Uses `--oplog` and applies captured changes with `--oplogReplay` during restore |
+| `full` (default) | One logical dump of the replica set | Uses `--oplog` and applies captured changes with `--oplogReplay` during restore |
 | `per-database` | One object per selected database | No oplog; point-in-time consistency is not guaranteed, even within a database or collection |
+| `partial` (automatic fallback from `full`) | One object per successfully dumped, visible application database | No oplog or point-in-time guarantee |
 
 Designed for self-managed replica sets. Sharded clusters, standalone servers, and continuous point-in-time recovery are not supported.
 `full` does not accept database or collection filters or exclusions. MongoDB's `--oplog` requires a full dump.
@@ -96,7 +97,7 @@ docker compose -f compose.yml up -d backup
 docker compose -f compose.yml run --rm backup mongodb-backup-s3 backup
 ```
 
-This example backs up the entire replica set, including users, roles, and oplog, daily at 02:00 Asia/Tokyo.
+This example takes a MongoDB Tools logical backup, including users, roles and oplog, daily at 02:00 Asia/Tokyo.
 After a successful backup, timestamped backups older than seven days are deleted from the destination.
 Use a separate `S3_PREFIX` for each replica set. For S3-compatible storage, set `S3_ENDPOINT` in `.env`;
 for temporary AWS credentials, also set `S3_SESSION_TOKEN`.
@@ -116,7 +117,7 @@ and add the read-only mount to the `backup` service. Populate `./backup-config` 
 
 ## MongoDB connection and permissions
 
-Leave the database path empty in the URI and set the authentication database with `authSource`.
+Leave the database path empty in the URI. Authenticated per-database dumps and automatic partial recovery require a single, explicit `authSource` in the URI, because `mongodump --db` otherwise changes the authentication database.
 URL-encode reserved characters in usernames and passwords.
 
 ```dotenv
@@ -126,7 +127,7 @@ MONGODB_READ_PREFERENCE=primary
 
 To supply the URI through a secret file, leave `MONGODB_URI` empty, set `MONGODB_URI_FILE=/run/secrets/mongodb_uri`,
 and mount the file read-only. Setting both variables is an error.
-The URI is passed to child processes through a temporary configuration file with `0600` permissions, rather than command-line arguments.
+MongoDB Tools receives the URI and GPG receives its passphrase through inherited file descriptors. The temporary files are unlinked before credentials are written.
 
 MongoDB Tools 100.19.1 fixes an earlier bug that interpreted URI timeout milliseconds as seconds.
 **Breaking change:** when specified, `serverSelectionTimeoutMS` and `connectTimeoutMS` must be positive
@@ -143,6 +144,7 @@ does not provide a MongoDB operation timeout. The metadata client's 30-second li
 `mongodump` or `mongorestore`. An operation that stops responding may require cancellation with SIGTERM/SIGINT.
 
 Enable TLS with `tls=true` in the URI. For a custom CA, mount the CA file and set `MONGODB_TLS_CA_FILE` to its container path.
+Backup and restore reject a CA file with TLS disabled or certificate/hostname verification disabled before accessing S3. If the URI also specifies a CA file, both paths must match. The metadata client and MongoDB Tools use the mounted CA file for server verification.
 Certificates collected as server configuration are not automatically applied to connection settings.
 
 **Breaking change:** `restore` and `restore-auth` reject `w=0` and repeated `w` URI options,
@@ -150,6 +152,8 @@ including differently capitalized or percent-encoded forms. Unacknowledged write
 `mongorestore` to report success even when the server rejects documents. Omit `w` to use the tool's
 default, or select an acknowledged write concern such as `w=1` or `w=majority`.
 This validation also applies to `MONGODB_URI_FILE`; backup and configuration extraction are unaffected.
+
+The distributed binary rejects Kerberos (`authMechanism=GSSAPI`) during URI validation.
 
 Grant the backup account the `backup` and `clusterMonitor` roles on `admin`.
 `clusterMonitor` is used to retrieve the active replica set configuration and status.
@@ -166,10 +170,9 @@ db.getSiblingDB('admin').createUser({
 });
 ```
 
-`MONGODB_READ_PREFERENCE=secondary` directs backup data reads and replica metadata commands to secondaries.
-MongoDB Tools still use the primary for database/collection enumeration, so this does not guarantee a backup with the primary unavailable.
-`secondaryPreferred` falls back to the primary when no secondary is available.
-Check I/O load, replication lag, and oplog retention on the members serving reads.
+A `full` run always uses the writable primary and warns if another read preference was requested. Every backup mode uses `hello` and `getCmdLineOpts` to verify an ordinary replica set primary before and after dumping. Direct connections to a shard or config server are rejected. Publication stops if the election changes or the server role cannot be verified.
+
+In `per-database` mode, each non-primary read preference selects a member for that database. Before dumping, the application checks the writable primary’s last applied operation, waits up to 30 seconds for the selected member’s applied and majority-committed positions, and pins the data and auth dumps to that member. A primary that advertises itself as the only data-bearing candidate triggers immediate fallback for secondary reads. If selection or catch-up cannot be verified, the application warns and takes that database’s backup from the verified primary. The next database independently uses the requested preference. Allow primary capacity for these fallbacks. If the fallback primary has applied writes beyond its majority snapshot, the backup honors the URI or cluster-default read concern; reading the cluster default requires `getDefaultRWConcern`. Specify `readConcernLevel` only once in the URI; option names are case-insensitive. A failed primary check or an election change aborts publication for the affected database.
 Restores connect to the writable target; this backup setting does not direct restores to a secondary.
 
 ## Per-database backups
@@ -211,12 +214,49 @@ Each database bundle includes authentication information in a separate `auth.arc
 This is **a dump of the admin database containing users and roles for all databases**, not just the selected database.
 Data and authentication information are captured sequentially for each database, so they are not a single point-in-time snapshot.
 
+Each selected database is checked immediately before its data dump and again before publication. If it disappears, its previous generation is preserved and remaining databases are processed. This checks the database name. Collection changes are allowed, including replacements with new UUIDs. An existing collection with zero documents is valid.
+
 Writes during a `per-database` backup may produce a mixture of data from before and after updates.
 If consistency is required, stop writes and schema changes to the target databases or use `full`.
 
+## Recovering data when a full backup cannot list all databases
+
+A `full` run requests the cluster-wide database list before dumping and again before publishing. If either list contains a name beginning with `__mdb_internal`, the run fails and preserves previous generations. MongoDB Tools excludes those names from full dumps. The full manifest records the final list, including system databases, in `observed_databases`. This field describes the server inventory at the final check. For the internal `config` database, Database Tools includes only `chunks`, `collections`, `databases`, `settings`, `shards`, `tags`, and `version`. The application checks the collection inventory before and after dumping. It warns about excluded names it does not recognize as built-in, records their union in `excluded_config_collections`, and publishes the remaining data. Restore repeats this warning.
+If either request fails, it tries to list the databases visible to the backup account and dumps each
+application database separately. Each successful dump is saved under `partial/<DB>/`, even if another
+database fails. The log lists the saved databases. If the visible list is unavailable, no new backup is saved.
+The one-shot command returns exit code 1 even when partial data was saved. Scheduled runs report the
+failure and try a full backup again at the next scheduled time. Previous full backups remain available.
+
+A restricted account needs the cluster action `getCmdLineOpts` to identify the server role before any partial data can be published. An administrator can grant this action independently of cluster-wide database inventory privileges:
+
+```javascript
+const admin = db.getSiblingDB("admin")
+admin.createRole({role: "verifyBackupRole", privileges: [
+  {resource: {cluster: true}, actions: ["getCmdLineOpts"]}
+], roles: []})
+admin.grantRolesToUser("partialreader", ["verifyBackupRole"])
+```
+
+Each partial manifest records `mode: partial` and the captured database name. The bundle omits the oplog,
+users, roles, and the `admin`, `config`, and `local` databases. It includes mounted configuration files
+when configured. Server version, FCV and replica set configuration are collected independently. Each authorized value is recorded and rechecked after the dump.
+The database list and data are limited by the account's permissions.
+
+Both filename modes apply under the partial database's own prefix. Timestamp mode creates a new generation
+for each successful dump. Fixed mode follows the bucket versioning policy below. Retention runs within the saved database's partial prefix.
+
+To recover one database, set `BACKUP_MODE=partial` and `MONGODB_DATABASE=app` in the restore environment.
+Use the filename mode reported for that upload. For example, with the CLI in that environment:
+
+```sh
+BACKUP_FILENAME_MODE=timestamp mongodb-backup-s3 restore 2026-09-13T03:00:00-0123456789abcdef0123456789abcdef
+BACKUP_FILENAME_MODE=fixed mongodb-backup-s3 restore --version-id VERSION_ID
+```
+
 ## Backing up configuration, keys, and certificates
 
-The active replica set configuration, equivalent to `rs.conf()`, is retrieved from the connected server and saved as `replica-set.json` in every backup.
+Full and per-database bundles include the active replica set configuration, equivalent to `rs.conf()`, as `replica-set.json`. Partial bundles include it when replica metadata is accessible.
 Local files such as `mongod.conf`, an initialization `rs.conf`, keyFiles, TLS certificates and private keys, and Compose definitions
 cannot be retrieved through the MongoDB connection. Collect them in a directory and mount it read-only.
 
@@ -249,7 +289,7 @@ After collection, the tool rechecks the file list, content hashes, and original 
 This check reads the configuration files again; it is not an atomic filesystem snapshot.
 If a configured directory contains unreadable files or is empty, the backup fails.
 
-Dumps include users, roles, and SCRAM authentication information. They do not retrieve plaintext passwords.
+Full and per-database dumps include users, roles, and SCRAM authentication information. They do not retrieve plaintext passwords.
 Credentials from external authentication systems and files that have not been mounted are not included.
 Because backups can contain secrets, set `PASSPHRASE` when needed and store the decryption value separately from S3.
 
@@ -263,12 +303,13 @@ This keeps data and configuration from different backup generations from being m
 backup/full/2026-09-13T03:00:00-0123456789abcdef0123456789abcdef.zip.gpg
 backup/per-database/app/2026-09-13T03:00:00-0123456789abcdef0123456789abcdef.zip.gpg
 backup/per-database/analytics/2026-09-13T03:00:01-fedcba9876543210fedcba9876543210.zip.gpg
+backup/partial/app/latest.zip.gpg
 ```
 
 After decryption, the bundle has the following structure. `data.archive.gz` uses MongoDB's own archive format.
 
 ```text
-data.archive.gz       # full: all data + oplog; per-database: the selected database
+data.archive.gz       # full: logical dump + oplog; per-database or partial: one database
 auth.archive.gz       # per-database only: admin database with all users and roles
 replica-set.json      # Active replica set configuration
 config/...            # Optional mounted configuration files
@@ -323,7 +364,7 @@ Use S3 Lifecycle rules to manage their retention and clean up incomplete multipa
 
 Backups stream through archive → ZIP → optional GPG encryption → S3.
 ZIP64 supports entries larger than 4 GiB without storing the entire dump in memory or on temporary disk.
-Even for a 50 GB database, each run is a full logical backup that reads all data.
+Even for a 50 GB database, each run reads all selected data to produce a logical backup.
 Duration depends on compression CPU usage, network speed, and database read load.
 `full` requires the oplog to cover the entire dump, so allow enough retention for increases in write volume.
 Avoid operations that `mongodump --oplog` does not support during a dump, such as renaming collections.
@@ -438,7 +479,7 @@ Original ownership and permissions are not restored automatically; adjust them w
 | Variable | Default | Description |
 | --- | --- | --- |
 | `MONGODB_URI` / `MONGODB_URI_FILE` | Required | Set one; not required for `extract-config` |
-| `MONGODB_READ_PREFERENCE` | `primary` | `primary` / `primaryPreferred` / `secondary` / `secondaryPreferred` / `nearest` |
+| `MONGODB_READ_PREFERENCE` | `primary` | Per-database preference. Full backups always use the primary. Values: `primary`, `primaryPreferred`, `secondary`, `secondaryPreferred`, `nearest`. |
 | `MONGODB_TLS_CA_FILE` | Empty | CA file for TLS verification |
 | `MONGODB_PARALLEL_COLLECTIONS` | `4` | Dump concurrency and requested restore concurrency; 1–128. During restore, MongoDB Tools may increase this to consume the archive's multiplexed streams; this is not a restore concurrency cap. |
 | `MONGODB_CONFIG_DIR` | Empty | Directory containing configuration files to back up |
@@ -455,7 +496,7 @@ Original ownership and permissions are not restored automatically; adjust them w
 | `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | Empty | Optional credentials; AWS SDK credential providers are also supported |
 | `S3_SESSION_TOKEN` | Empty | Token for temporary credentials |
 | `S3_UPLOAD_PART_SIZE_MB` | `8` | Multipart part size in MiB; 5–5120. Streaming output limit is 10,000 parts; see the size table above. |
-| `SCHEDULE` | Empty | Cron expression, cron with seconds, `@daily`, etc. |
+| `SCHEDULE` | Empty | Cron expression, optional seconds, `@daily`, or `@every` with a positive whole-second interval. A timezone prefix requires a schedule. |
 | `BACKUP_KEEP_DAYS` | Empty | Delete expired backups after success; 1–36500 days |
 | `BACKUP_FILENAME_MODE` | `timestamp` | `timestamp` / `fixed` |
 | `BACKUP_ALLOW_UNVERSIONED_OVERWRITE` | `false` | In fixed mode, allow overwriting the fixed key when versioning is disabled or cannot be verified. Accepts exactly `true` or `false`. |
@@ -481,15 +522,17 @@ Integration tests start disposable MongoDB replica set and Silo containers.
 CI pulls both fixture images before starting the per-test timeouts. CI runs the final image's runtime checks and backup/restore integration suite on native amd64 and arm64
 runners. Both architectures must pass before the publishing job runs.
 Backup commands use a dedicated account with only `backup` and `clusterMonitor` roles;
-fixture setup and restores use a separate administrator. Tests also verify that insufficient privileges
-prevent publication and that conditional writes preserve existing generations.
+fixture setup and restores use a separate administrator. Restricted-account tests verify that a failed
+cluster-wide listing preserves the previous full backup and that a visible database can be restored
+from both timestamped and versioned fixed-name partial backups. Tests also check that conditional
+writes preserve existing generations.
 Tests cover literal commas in JSON database selections/exclusions, scheduled recurrence after failures,
 overlap prevention, and SIGTERM/SIGINT during schedule waits and active multipart uploads.
 Control-character database names are backed up and restored without changing the names, and application
 log tests verify escaping on success, failure, retention, and download paths. Streaming upload tests reduce
 the SDK's part-count limit to exercise the exact size boundary and one byte over it with multiple part sizes,
 including aborting oversized uploads without publication.
-Connection tests add a non-voting secondary and reject data and replica metadata reads on the primary while backing up,
+Per-database connection tests add a non-voting secondary and reject data and replica metadata reads on the primary while backing up,
 so both the Go metadata commands and MongoDB Tools' data reads must use the secondary. The tests repeat with TLS and a freshly
 generated private CA, restore to a primary, and reject an unrelated CA and a mismatched hostname in both
 backup and restore. Certificates are generated by the tests; no production certificates are used.

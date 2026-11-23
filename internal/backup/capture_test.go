@@ -2,6 +2,8 @@ package backup
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	"os"
@@ -22,7 +24,7 @@ func TestCaptureConfigNestedFiles(t *testing.T) {
 		}
 	}
 	got := map[string]string{}
-	err := captureConfig(context.Background(), dir, func(name string, r io.Reader) error {
+	err := captureForTest(context.Background(), dir, func(name string, r io.Reader) error {
 		data, err := io.ReadAll(r)
 		got[name] = string(data)
 		return err
@@ -53,7 +55,7 @@ func TestCaptureConfigDirectoryValidation(t *testing.T) {
 		{"regular file", file, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			err := captureConfig(context.Background(), tc.dir, func(string, io.Reader) error {
+			err := captureForTest(context.Background(), tc.dir, func(string, io.Reader) error {
 				t.Fatal("unexpected file capture")
 				return nil
 			})
@@ -71,7 +73,7 @@ func TestCaptureConfigDetectsEarlierFileChange(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	err := captureConfig(context.Background(), dir, func(name string, r io.Reader) error {
+	err := captureForTest(context.Background(), dir, func(name string, r io.Reader) error {
 		if _, err := io.Copy(io.Discard, r); err != nil {
 			return err
 		}
@@ -99,7 +101,7 @@ func TestCaptureConfigDetectsSameLengthRewrite(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			err = captureConfig(t.Context(), dir, func(name string, r io.Reader) error {
+			err = captureForTest(t.Context(), dir, func(name string, r io.Reader) error {
 				if _, err := io.Copy(io.Discard, r); err != nil {
 					return err
 				}
@@ -131,7 +133,7 @@ func TestCaptureConfigDetectsRootReplacement(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(dir, "mongod.conf"), []byte("old"), 0600); err != nil {
 				t.Fatal(err)
 			}
-			err := captureConfig(t.Context(), dir, func(_ string, r io.Reader) error {
+			err := captureForTest(t.Context(), dir, func(_ string, r io.Reader) error {
 				if _, err := io.Copy(io.Discard, r); err != nil {
 					return err
 				}
@@ -171,7 +173,7 @@ func TestCaptureConfigRejectsSymlinks(t *testing.T) {
 			if rootLink {
 				dir = link
 			}
-			err := captureConfig(context.Background(), dir, func(string, io.Reader) error {
+			err := captureForTest(context.Background(), dir, func(string, io.Reader) error {
 				t.Fatal("symlink content must not be captured")
 				return nil
 			})
@@ -188,7 +190,7 @@ func TestCaptureConfigCancellation(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	err := captureConfig(ctx, dir, func(_ string, r io.Reader) error {
+	err := captureForTest(ctx, dir, func(_ string, r io.Reader) error {
 		cancel()
 		_, err := io.Copy(io.Discard, r)
 		return err
@@ -196,7 +198,7 @@ func TestCaptureConfigCancellation(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want context cancellation", err)
 	}
-	err = captureConfig(ctx, dir, func(string, io.Reader) error {
+	err = captureForTest(ctx, dir, func(string, io.Reader) error {
 		t.Fatal("capture ran after cancellation")
 		return nil
 	})
@@ -213,7 +215,7 @@ func TestCaptureConfigDetectsChangesAndIncompleteReads(t *testing.T) {
 			if err := os.WriteFile(path, []byte("original configuration"), 0600); err != nil {
 				t.Fatal(err)
 			}
-			err := captureConfig(context.Background(), dir, func(_ string, r io.Reader) error {
+			err := captureForTest(context.Background(), dir, func(_ string, r io.Reader) error {
 				if mutation == "incomplete read" {
 					return nil
 				}
@@ -249,7 +251,7 @@ func TestCaptureConfigPropagatesWriterError(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantErr := errors.New("upload failed")
-	err := captureConfig(context.Background(), dir, func(string, io.Reader) error { return wantErr })
+	err := captureForTest(context.Background(), dir, func(string, io.Reader) error { return wantErr })
 	if !errors.Is(err, wantErr) || strings.Contains(err.Error(), "do-not-log-secret") {
 		t.Fatalf("error = %v, want sanitized upload error", err)
 	}
@@ -274,7 +276,7 @@ func TestCaptureConfigDetectsInventoryChangesWithoutNewModTime(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			err = captureConfig(t.Context(), dir, func(_ string, r io.Reader) error {
+			err = captureForTest(t.Context(), dir, func(_ string, r io.Reader) error {
 				if _, err := io.Copy(io.Discard, r); err != nil {
 					return err
 				}
@@ -298,4 +300,12 @@ func TestCaptureConfigDetectsInventoryChangesWithoutNewModTime(t *testing.T) {
 			}
 		})
 	}
+}
+
+func captureForTest(ctx context.Context, dir string, consume func(string, io.Reader) error) error {
+	return captureConfig(ctx, dir, func(name string, r io.Reader) (string, error) {
+		h := sha256.New()
+		err := consume(name, io.TeeReader(r, h))
+		return hex.EncodeToString(h.Sum(nil)), err
+	})
 }

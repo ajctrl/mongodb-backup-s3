@@ -86,8 +86,8 @@ func loadConfig(lookup func(string) (string, bool)) (Config, error) {
 			return c, err
 		}
 	}
-	if c.BackupMode != "full" && c.BackupMode != "per-database" {
-		return c, fmt.Errorf("BACKUP_MODE must be full or per-database")
+	if c.BackupMode != "full" && c.BackupMode != "per-database" && c.BackupMode != "partial" {
+		return c, fmt.Errorf("BACKUP_MODE must be full, per-database, or partial (restore only)")
 	}
 	if c.BackupAll != "true" && c.BackupAll != "false" {
 		return c, fmt.Errorf("MONGODB_BACKUP_ALL must be true or false")
@@ -141,10 +141,22 @@ func validateURI(raw string) error {
 	if err != nil {
 		return fmt.Errorf("invalid MONGODB_URI query")
 	}
+	seenReadConcern := false
 	seenTimeouts := make(map[string]bool, 2)
 	for key, values := range q {
 		option := strings.ToLower(key)
 		switch option {
+		case "authmechanism":
+			for _, value := range values {
+				if strings.EqualFold(value, "GSSAPI") {
+					return fmt.Errorf("GSSAPI authentication is unsupported in this build")
+				}
+			}
+		case "readconcernlevel":
+			if seenReadConcern || len(values) != 1 {
+				return fmt.Errorf("MONGODB_URI readConcernLevel must not be repeated")
+			}
+			seenReadConcern = true
 		case "readpreference", "readpreferencetags", "maxstalenessseconds":
 			return fmt.Errorf("use MONGODB_READ_PREFERENCE instead of read preference URI options")
 		case "sockettimeoutms", "timeoutms":
@@ -201,7 +213,39 @@ func (c Config) requireConnection() error {
 	if c.URI == "" {
 		return fmt.Errorf("set MONGODB_URI or MONGODB_URI_FILE")
 	}
-	return validateURI(c.URI)
+	if err := validateURI(c.URI); err != nil {
+		return err
+	}
+	if c.TLSCA != "" {
+		// Resolve TLS exactly as the metadata client does, including SRV defaults.
+		_, _, err := metadataOptions(c)
+		return err
+	}
+	return nil
+}
+
+func (c Config) requireDatabaseAuthSource() error {
+	u, err := mongoURIOptions(c.URI)
+	if err != nil {
+		return err
+	}
+	authenticated := u.User != nil
+	hasSource := false
+	for key, values := range u.Query() {
+		if strings.EqualFold(key, "authSource") {
+			if hasSource || len(values) != 1 || values[0] == "" {
+				return fmt.Errorf("database-scoped dumps require a single nonempty authSource")
+			}
+			hasSource = true
+		}
+		if strings.EqualFold(key, "authMechanism") {
+			authenticated = true
+		}
+	}
+	if authenticated && !hasSource {
+		return fmt.Errorf("database-scoped dumps require explicit authSource in an authenticated MONGODB_URI")
+	}
+	return nil
 }
 
 func (c Config) requireRestoreConnection() error {
@@ -239,6 +283,9 @@ func (c Config) validateBackup() (int, error) {
 			return 0, fmt.Errorf("full backup requires clearing all MongoDB database selectors")
 		}
 	} else if c.BackupMode == "per-database" {
+		if err := c.requireDatabaseAuthSource(); err != nil {
+			return 0, err
+		}
 		if c.BackupAll == "true" && (c.Database != "" || len(c.Databases) > 0) {
 			return 0, fmt.Errorf("MONGODB_BACKUP_ALL cannot be combined with explicit databases")
 		}
@@ -263,7 +310,7 @@ func (c Config) validateBackup() (int, error) {
 			}
 		}
 	} else {
-		return 0, fmt.Errorf("BACKUP_MODE must be full or per-database")
+		return 0, fmt.Errorf("backup requires BACKUP_MODE=full or per-database; partial is selected automatically and can be specified only for recovery")
 	}
 	if c.KeepDays == "" {
 		return 0, nil
@@ -285,7 +332,7 @@ func parseDatabaseList(value string) ([]string, error) {
 	var names []string
 	// Require an array, not JSON null. Do not trim individual names: whitespace
 	// may be part of a Linux DB name, and separators may be literal commas.
-	if !utf8.ValidString(value) || !strings.HasPrefix(strings.TrimSpace(value), "[") || json.Unmarshal([]byte(value), &names) != nil {
+	if !utf8.ValidString(value) || !strings.HasPrefix(strings.TrimSpace(value), "[") || json.Unmarshal([]byte(value), &names) != nil || !validSurrogates(value) {
 		return nil, fmt.Errorf("must be a JSON array of database names (for example [\"app\",\"private,archive\"]); comma-separated lists are no longer supported")
 	}
 	for _, name := range names {
@@ -295,6 +342,35 @@ func parseDatabaseList(value string) ([]string, error) {
 	}
 	return names, nil
 }
+
+// encoding/json accepts lone surrogate escapes by silently substituting U+FFFD.
+// Scan the syntactically valid JSON, skipping escaped backslashes.
+func validSurrogates(value string) bool {
+	for i := 0; i < len(value); i++ {
+		if value[i] != '\\' {
+			continue
+		}
+		i++
+		if value[i] != 'u' {
+			continue
+		}
+		first, _ := strconv.ParseUint(value[i+1:i+5], 16, 16)
+		i += 4
+		if first < 0xd800 || first > 0xdfff {
+			continue
+		}
+		if first >= 0xdc00 || len(value) < i+7 || value[i+1:i+3] != `\u` {
+			return false
+		}
+		second, _ := strconv.ParseUint(value[i+3:i+7], 16, 16)
+		if second < 0xdc00 || second > 0xdfff {
+			return false
+		}
+		i += 6
+	}
+	return true
+}
+
 func systemDatabase(name string) bool { return name == "admin" || name == "local" || name == "config" }
 func validateDatabases(names []string) error {
 	if len(names) == 0 {
@@ -346,7 +422,7 @@ func (c Config) timestampPrefix(database string) string {
 	if c.BackupMode == "full" {
 		return p + "full/"
 	}
-	return p + "per-database/" + encodeComponent(database) + "/"
+	return p + c.BackupMode + "/" + encodeComponent(database) + "/"
 }
 func (c Config) fixedKey(database string) string {
 	return c.timestampPrefix(database) + "latest" + c.fileType()

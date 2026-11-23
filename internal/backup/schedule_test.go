@@ -165,7 +165,7 @@ func TestScheduledBackupSkipsOverlapAndWaitsForCancellationCleanup(t *testing.T)
 }
 
 func TestInvalidScheduleStartsNoBackup(t *testing.T) {
-	for _, schedule := range []string{"invalid", "0 0 30 2 *"} {
+	for _, schedule := range []string{"invalid", "0 0 30 2 *", "TZ=UTC", "CRON_TZ=Asia/Tokyo  ", "TZ= @daily", "@every 0s", "TZ=UTC @every -1m", "@every 500ms", "@every 1.9s"} {
 		t.Run(schedule, func(t *testing.T) {
 			a, store, source, _ := newAppTest(t, "full")
 			a.Config.Schedule = schedule

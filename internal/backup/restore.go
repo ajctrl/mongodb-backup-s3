@@ -43,7 +43,7 @@ func (a *App) validateRestore(args []string) (string, string, error) {
 func (a *App) Restore(ctx context.Context, args []string) error { return a.restore(ctx, args, false) }
 func (a *App) RestoreAuth(ctx context.Context, args []string) error {
 	if a.Config.BackupMode != "per-database" {
-		return fmt.Errorf("restore-auth requires per-database mode; full restore already includes authentication")
+		return fmt.Errorf("restore-auth requires per-database mode; full restore includes authentication and partial backups contain application data only")
 	}
 	return a.restore(ctx, args, true)
 }
@@ -61,6 +61,9 @@ func (a *App) restore(ctx context.Context, args []string, auth bool) error {
 	defer lock.Close()
 	return a.withRunner(lock, func(r commandRunner) error {
 		return a.withBundle(ctx, args, r, func(z *zip.ReadCloser, m Manifest, _ string) error {
+			if len(m.ExcludedConfigCollections) > 0 {
+				fmt.Fprintf(a.Err, "Warning: this backup excludes config database collections %q.\n", m.ExcludedConfigCollections)
+			}
 			name := "data.archive.gz"
 			if auth {
 				name = "auth.archive.gz"
@@ -100,7 +103,11 @@ func (a *App) restore(ctx context.Context, args []string, auth bool) error {
 				// them in the tool's pattern grammar (not shell quoting).
 				cmd = append(cmd, "--nsInclude="+strings.ReplaceAll(a.Config.Database, "*", `\*`)+".*")
 			}
-			fmt.Fprintf(a.Out, "Restoring backup created with %s (MongoDB %s, FCV %s)...\n", m.ToolsVersion, m.ServerVersion, m.FCV)
+			if m.Mode == "partial" {
+				fmt.Fprintf(a.Out, "Restoring partial data for %q; cluster database inventory was unverified.\n", m.Database)
+			} else {
+				fmt.Fprintf(a.Out, "Restoring backup created with %s (MongoDB %s, FCV %s)...\n", m.ToolsVersion, m.ServerVersion, m.FCV)
+			}
 			if err := a.restoreArchive(ctx, r, f, cmd...); err != nil {
 				return err
 			}

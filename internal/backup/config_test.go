@@ -299,3 +299,31 @@ func TestGenerationValidation(t *testing.T) {
 		t.Fatal("valid generation rejected")
 	}
 }
+
+func TestDatabaseListUnicodeEscapes(t *testing.T) {
+	for _, s := range []string{`["\ud800"]`, `["\udc00"]`, `["\ud800\u000a"]`, `["\ud800","\udc00"]`} {
+		if _, err := parseDatabaseList(s); err == nil {
+			t.Errorf("accepted lone surrogate: %s", s)
+		}
+	}
+	for _, s := range []string{`["\ufffd"]`, `["�"]`, `["\ud83d\ude00"]`} {
+		got, err := parseDatabaseList(s)
+		if err != nil || len(got) != 1 || (got[0] != "�" && got[0] != "😀") {
+			t.Fatalf("%s: %q, %v", s, got, err)
+		}
+	}
+}
+
+func TestGSSAPIRejectedAtURIValidation(t *testing.T) {
+	if err := validateURI("mongodb://user@host/?authSource=%24external&authMechanism=gssapi"); err == nil || !strings.Contains(err.Error(), "GSSAPI") {
+		t.Fatalf("GSSAPI validation: %v", err)
+	}
+}
+
+func TestRepeatedReadConcern(t *testing.T) {
+	for _, query := range []string{"readConcernLevel=local&ReadConcernLevel=majority", "readConcernLevel=local&readConcernLevel=majority", "readConcernLevel=majority&read%43oncernLevel=local"} {
+		if err := validateURI("mongodb://host/?" + query); err == nil {
+			t.Fatalf("accepted duplicate read concern: %s", query)
+		}
+	}
+}

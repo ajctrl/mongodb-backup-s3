@@ -2,17 +2,59 @@ package backup
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/drivertest"
 )
+
+func TestFallbackPrimaryRequiresRequestedMajoritySnapshot(t *testing.T) {
+	const host = "node:27017"
+	hello := bson.D{
+		{Key: "ok", Value: 1}, {Key: "me", Value: host}, {Key: "hosts", Value: bson.A{host}},
+		{Key: "setName", Value: "rs"}, {Key: "isWritablePrimary", Value: true},
+		{Key: "electionId", Value: bson.NewObjectID()},
+		{Key: "lastWrite", Value: bson.M{
+			"opTime":         bson.M{"ts": bson.Timestamp{T: 2}},
+			"majorityOpTime": bson.M{"ts": bson.Timestamp{T: 1}},
+		}},
+	}
+	for _, concern := range []string{"local", "majority"} {
+		t.Run(concern, func(t *testing.T) {
+			opts := options.Client()
+			opts.Deployment = drivertest.NewMockDeployment(hello, hello)
+			client, err := mongo.Connect(opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Disconnect(context.Background())
+			source := mongoSource{client: client, pref: readpref.Primary()}
+			ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+			defer cancel()
+			pinned, _, err := source.dumpMember(ctx, "mongodb://"+host+"/?readConcernLevel="+concern)
+			if concern == "local" {
+				if err != nil || pinned == "" {
+					t.Fatalf("local primary selection: %q, %v", pinned, err)
+				}
+			} else if !errors.Is(err, context.DeadlineExceeded) || pinned != "" {
+				t.Fatalf("majority primary selection: %q, %v", pinned, err)
+			}
+		})
+	}
+}
 
 func TestMetadataOptions(t *testing.T) {
 	c := Config{URI: "mongodb://backup:do-not-log@localhost/?replicaSet=rs0", ReadPreference: "secondary"}
@@ -102,5 +144,72 @@ func TestNewSourceAlreadyCanceled(t *testing.T) {
 	_, err := NewSource(ctx, Config{})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want cancellation before connecting", err)
+	}
+}
+
+func TestMetadataCustomCAReplacesSystemRoots(t *testing.T) {
+	server := httptest.NewTLSServer(nil)
+	defer server.Close()
+	custom := server.Certificate()
+	ca := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(ca, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: custom.Raw}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, option := range []string{"tlsInsecure", "sSlInsecure", "tlsAllowInvalidCertificates", "tlsAllowInvalidHostnames", "sslAllowInvalidCertificates", "sslAllowInvalidHostnames"} {
+		c := Config{URI: "mongodb://localhost/?tls=true&" + option + "=true", TLSCA: ca}
+		if err := c.requireConnection(); err == nil {
+			t.Fatalf("custom CA allowed %s", option)
+		}
+	}
+	other := filepath.Join(t.TempDir(), "other.pem")
+	cert, err := os.ReadFile(ca)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(other, cert, 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"tlsCAFile", "sslCertificateAuthorityFile", "sslCAFile"} {
+		cfg := Config{URI: "mongodb://localhost/?tls=true&" + key + "=" + other, TLSCA: ca}
+		if err := cfg.requireRestoreConnection(); err == nil {
+			t.Fatal("accepted conflicting CA files")
+		}
+	}
+	opts, _, err := metadataOptions(Config{URI: "mongodb://localhost/?tls=true", TLSCA: ca})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := x509.NewCertPool()
+	pool.AddCert(custom)
+	if !pool.Equal(opts.TLSConfig.RootCAs) {
+		t.Fatal("custom CA configuration trusts additional roots")
+	}
+	system, err := x509.SystemCertPool()
+	if err != nil || system.Equal(pool) {
+		t.Fatal("test requires distinct system and custom trust roots")
+	}
+}
+
+func TestDirectDumpURIPreservesConnectionOptions(t *testing.T) {
+	for _, raw := range []string{
+		"mongodb+srv://reader:p%40ss@example.invalid/?authSource=admin&srvMaxHosts=1&authMechanism=SCRAM-SHA-256",
+		"mongodb://reader:p%40ss@one.invalid:27017,two.invalid:27017/?authSource=admin&TLS=true&directConnection=false&authMechanism=SCRAM-SHA-256",
+	} {
+		pinned, err := directDumpURI(raw, "[::1]:29000", "rs1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		u, err := url.Parse(pinned)
+		if err != nil {
+			t.Fatal(err)
+		}
+		q := u.Query()
+		password, _ := u.User.Password()
+		if u.Scheme != "mongodb" || u.Host != "[::1]:29000" || password != "p@ss" ||
+			q.Get("authSource") != "admin" || q.Get("authMechanism") != "SCRAM-SHA-256" ||
+			q.Get("replicaSet") != "rs1" || q.Get("directConnection") != "true" || q.Has("srvMaxHosts") ||
+			(q.Get("tls") != "true" && q.Get("TLS") != "true") {
+			t.Fatal("pinned connection lost authentication, TLS, or replica set settings")
+		}
 	}
 }

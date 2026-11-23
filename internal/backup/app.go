@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -16,6 +15,7 @@ import (
 
 	"github.com/ajctrl/mongodb-backup-s3/internal/storage"
 	"github.com/robfig/cron/v3"
+	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
 type App struct {
@@ -30,8 +30,27 @@ type App struct {
 func New(c Config, s storage.Store, out, stderr io.Writer) *App {
 	return &App{Config: c, Store: s, Out: out, Err: stderr, now: time.Now, lockPath: "/tmp/mongodb-backup-s3.lock", newSource: NewSource}
 }
-func scheduleParser() cron.Parser {
-	return cron.NewParser(cron.SecondOptional | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor)
+func parseSchedule(spec string) (cron.Schedule, error) {
+	fields := strings.Fields(spec)
+	expr := fields
+	if len(fields) > 0 && (strings.HasPrefix(fields[0], "TZ=") || strings.HasPrefix(fields[0], "CRON_TZ=")) {
+		_, zone, _ := strings.Cut(fields[0], "=")
+		if zone == "" || len(fields) < 2 {
+			return nil, fmt.Errorf("timezone requires a name and a schedule")
+		}
+		expr = fields[1:]
+	}
+	if len(expr) > 0 && expr[0] == "@every" {
+		if len(expr) != 2 {
+			return nil, fmt.Errorf("@every requires one duration")
+		}
+		d, err := time.ParseDuration(expr[1])
+		if err != nil || d < time.Second || d%time.Second != 0 {
+			return nil, fmt.Errorf("@every requires a positive whole number of seconds")
+		}
+	}
+	parser := cron.NewParser(cron.SecondOptional | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor)
+	return parser.Parse(strings.Join(fields, " "))
 }
 func (a *App) Run(ctx context.Context) error {
 	if a.Config.Schedule == "" {
@@ -40,7 +59,7 @@ func (a *App) Run(ctx context.Context) error {
 	if _, err := a.Config.validateBackup(); err != nil {
 		return err
 	}
-	schedule, err := scheduleParser().Parse(a.Config.Schedule)
+	schedule, err := parseSchedule(a.Config.Schedule)
 	if err != nil {
 		return fmt.Errorf("invalid SCHEDULE: %w", err)
 	}
@@ -61,28 +80,26 @@ func (a *App) Run(ctx context.Context) error {
 }
 
 func (a *App) withRunner(lock *os.File, action func(commandRunner) error) (err error) {
-	dir, err := os.MkdirTemp("/tmp", "mongodb-backup-s3-auth-")
-	if err != nil {
-		return err
-	}
-	defer func() { err = errors.Join(err, os.RemoveAll(dir)) }()
-	path := filepath.Join(dir, "tools.yml")
-	// JSON-quoted strings are YAML scalars, including passwords with quotes or #.
-	uri, _ := json.Marshal(a.Config.URI)
-	if err := os.WriteFile(path, append([]byte("uri: "), append(uri, '\n')...), 0600); err != nil {
-		return err
-	}
 	redacted := newSecretWriter(a.Err, a.Config)
 	defer redacted.Flush()
-	r := commandRunner{defaultsFile: path, stderr: redacted, lock: lock}
-	if a.Config.Passphrase != "" {
-		r.passphraseFile = filepath.Join(dir, "passphrase")
-		if err := os.WriteFile(r.passphraseFile, []byte(a.Config.Passphrase), 0600); err != nil {
-			return err
+	var authMechanism string
+	if u, err := mongoURIOptions(a.Config.URI); err == nil {
+		for key, values := range u.Query() {
+			if strings.EqualFold(key, "authMechanism") && len(values) == 1 {
+				authMechanism = values[0]
+			}
 		}
 	}
-	return action(r)
+	r := commandRunner{authMechanism: authMechanism, passphrase: a.Config.Passphrase, stderr: redacted, lock: lock}
+	return action(r.withURI(a.Config.URI))
 }
+
+func (r commandRunner) withURI(uri string) commandRunner {
+	encoded, _ := json.Marshal(uri)
+	r.defaults = "uri: " + string(encoded) + "\n"
+	return r
+}
+
 func withWorkspace(action func(string) error) (err error) {
 	dir, err := os.MkdirTemp("", "mongodb-backup-s3-")
 	if err != nil {
@@ -92,8 +109,7 @@ func withWorkspace(action func(string) error) (err error) {
 	return action(dir)
 }
 
-// Each run gets a copy of Config so its effective filename mode applies to all
-// databases in this run. Scheduled runs check the configured mode afresh.
+// Effective backup and filename modes apply only to this run.
 func (a App) Backup(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -125,15 +141,20 @@ func (a App) Backup(ctx context.Context) error {
 			}
 		}
 	}
+	if a.Config.BackupMode == "full" && a.Config.ReadPreference != "primary" {
+		fmt.Fprintf(a.Err, "Warning: full backup uses primary instead of read preference %q.\n", a.Config.ReadPreference)
+		a.Config.ReadPreference = "primary"
+	}
 	source, err := a.newSource(ctx, a.Config)
 	if err != nil {
 		return err
 	}
 	defer source.Close(context.Background())
-	databases, err := a.databases(ctx, source)
+	mode, databases, err := a.backupSelection(ctx, source)
 	if err != nil {
 		return err
 	}
+	a.Config.BackupMode = mode
 	return a.withRunner(lock, func(r commandRunner) error {
 		var version bytes.Buffer
 		if err := r.run(ctx, &version, "mongodump", "--version"); err != nil {
@@ -143,39 +164,90 @@ func (a App) Backup(ctx context.Context) error {
 		if toolsVersion == "" {
 			return fmt.Errorf("mongodump returned no version")
 		}
-		var failures []error
-		for _, db := range databases {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			started := a.now().UTC()
-			var key string
-			snapshot, err := source.Inspect(ctx)
-			if err == nil {
-				key, err = a.backupDatabase(ctx, r, source, db, snapshot, toolsVersion)
-			}
-			if err != nil {
-				fmt.Fprintf(a.Err, "Backup failed (%s): %v\n", a.label(db), err)
-				failures = append(failures, err)
-				continue
-			}
-			fmt.Fprintf(a.Out, "Backup complete: %s (key: %q)\n", a.label(db), key)
-			if a.Config.FilenameMode == "timestamp" {
-				generation := strings.TrimSuffix(strings.TrimPrefix(key, a.Config.timestampPrefix(db)), a.Config.fileType())
-				fmt.Fprintf(a.Out, "To restore %s using your existing restore setup, set BACKUP_FILENAME_MODE=timestamp and run mongodb-backup-s3 restore %s\n", a.label(db), generation)
-			}
-			if days > 0 {
-				if err := a.removeOldBackups(ctx, db, key, started, a.now().UTC(), days); err != nil {
-					failures = append(failures, err)
-					fmt.Fprintf(a.Err, "Retention failed (%s): %v\n", a.label(db), err)
-				}
-			}
+		err = a.backupSelected(ctx, r, source, databases, toolsVersion, days)
+		if !errors.Is(err, errFullInventoryLost) || ctx.Err() != nil {
+			return err
 		}
-		if len(failures) > 0 {
-			return fmt.Errorf("backup run completed with failures: %w", errors.Join(failures...))
+		databases, err = a.partialDatabases(ctx, source, err)
+		if err != nil {
+			return err
 		}
-		return nil
+		a.Config.BackupMode = "partial"
+		return a.backupSelected(ctx, r, source, databases, toolsVersion, days)
 	})
+}
+
+func (a *App) backupSelected(ctx context.Context, r commandRunner, source Source, databases []string, toolsVersion string, days int) error {
+	var failures []error
+	var partialDatabases []string
+	for _, db := range databases {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		started := a.now().UTC()
+		key, err := a.dumpSelectedDatabase(ctx, r, source, db, toolsVersion)
+
+		if err != nil {
+			fmt.Fprintf(a.Err, "Backup failed (%s): %v\n", a.label(db), err)
+			failures = append(failures, err)
+			continue
+		}
+		if a.Config.BackupMode == "partial" {
+			partialDatabases = append(partialDatabases, db)
+			fmt.Fprintf(a.Out, "Partial data saved for %q (key: %q). To restore, set BACKUP_MODE=partial, MONGODB_DATABASE=%q and BACKUP_FILENAME_MODE=%s.\n", db, key, db, a.Config.FilenameMode)
+		} else {
+			fmt.Fprintf(a.Out, "Backup complete: %s (key: %q)\n", a.label(db), key)
+		}
+		if a.Config.FilenameMode == "timestamp" {
+			generation := strings.TrimSuffix(strings.TrimPrefix(key, a.Config.timestampPrefix(db)), a.Config.fileType())
+			fmt.Fprintf(a.Out, "To restore %s using your existing restore setup, set BACKUP_FILENAME_MODE=timestamp and run mongodb-backup-s3 restore %s\n", a.label(db), generation)
+		}
+		if days > 0 {
+			if err := a.removeOldBackups(ctx, db, key, started, a.now().UTC(), days); err != nil {
+				failures = append(failures, err)
+				fmt.Fprintf(a.Err, "Retention failed (%s): %v\n", a.label(db), err)
+			}
+		}
+	}
+	if a.Config.BackupMode == "partial" {
+		failures = append(failures, fmt.Errorf("full backup incomplete: cluster database inventory unverified; saved partial databases: %q", partialDatabases))
+	}
+	if len(failures) > 0 {
+		return fmt.Errorf("backup run completed with failures: %w", errors.Join(failures...))
+	}
+	return nil
+}
+
+func (a App) dumpSelectedDatabase(ctx context.Context, runner commandRunner, source Source, db, toolsVersion string) (string, error) {
+	var election bson.ObjectID
+	if a.Config.BackupMode == "per-database" && a.Config.ReadPreference != "primary" {
+		uri, selectedElection, err := source.dumpMember(ctx, a.Config.URI)
+		if err != nil {
+			if ctx.Err() != nil {
+				return "", ctx.Err()
+			}
+			fmt.Fprintf(a.Err, "Warning: cannot verify %s reads for %q (%v); using the primary for this database.\n", a.Config.ReadPreference, db, err)
+			source = source.primaryView()
+			a.Config.ReadPreference = "primary"
+			uri, selectedElection, err = source.dumpMember(ctx, a.Config.URI)
+			if err != nil {
+				return "", fmt.Errorf("verify fallback primary: %w", err)
+			}
+		}
+		runner = runner.withURI(uri)
+		election = selectedElection
+	}
+	snapshot, err := source.Inspect(ctx, a.Config.BackupMode)
+	if err != nil {
+		return "", err
+	}
+	if !election.IsZero() && election != snapshot.ElectionID {
+		return "", errors.New("primary election changed before database dump")
+	}
+	if a.Config.BackupMode == "partial" && (snapshot.ServerVersion == "" || snapshot.FCV == "" || len(snapshot.ReplicaSet) == 0) {
+		fmt.Fprintf(a.Err, "Warning: partial backup of %q has incomplete cluster metadata.\n", db)
+	}
+	return a.backupDatabase(ctx, runner, source, db, snapshot, toolsVersion)
 }
 
 func (a *App) label(db string) string {
@@ -184,16 +256,53 @@ func (a *App) label(db string) string {
 	}
 	return strconv.Quote(db)
 }
-func (a *App) databases(ctx context.Context, source Source) ([]string, error) {
-	c := a.Config
-	if c.BackupMode == "full" {
-		return []string{""}, nil
+func (a *App) backupSelection(ctx context.Context, source Source) (string, []string, error) {
+	all, err := source.Databases(ctx, false, "")
+	if a.Config.BackupMode == "full" {
+		if err == nil {
+			return "full", []string{""}, validateFullInventory(all)
+		}
+		dbs, err := a.partialDatabases(ctx, source, err)
+		return "partial", dbs, err
+	}
+	if err != nil {
+		return "", nil, err
 	}
 	fmt.Fprintln(a.Err, "Warning: per-database backups do not provide a point-in-time snapshot while writes continue.")
-	all, err := source.Databases(ctx)
-	if err != nil {
+	dbs, err := a.Config.selectDatabases(all)
+	return a.Config.BackupMode, dbs, err
+}
+
+// mongodump excludes every name with this prefix during a full dump.
+func validateFullInventory(names []string) error {
+	for _, name := range names {
+		if strings.HasPrefix(name, "__mdb_internal") {
+			return fmt.Errorf("full backup refused: mongodump excludes database %q", name)
+		}
+	}
+	return nil
+}
+
+var errFullInventoryLost = errors.New("cannot confirm full database inventory after dump")
+
+func (a *App) partialDatabases(ctx context.Context, source Source, cause error) ([]string, error) {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	fmt.Fprintf(a.Err, "Warning: full inventory unverified (%v). Attempting partial backups of visible application databases without oplog.\n", cause)
+	if err := a.Config.requireDatabaseAuthSource(); err != nil {
+		return nil, errors.Join(cause, err)
+	}
+	visible, err := source.Databases(ctx, true, "")
+	if err != nil {
+		return nil, fmt.Errorf("cannot list visible databases for partial backup: %w", errors.Join(cause, err))
+	}
+	c := a.Config
+	c.BackupAll = "true"
+	return c.selectDatabases(visible)
+}
+
+func (c Config) selectDatabases(all []string) ([]string, error) {
 	exists := make(map[string]bool, len(all))
 	for _, name := range all {
 		exists[name] = true
@@ -240,7 +349,7 @@ func (a *App) databases(ctx context.Context, source Source) ([]string, error) {
 func (a *App) connectionArgs() []string {
 	var args []string
 	if a.Config.TLSCA != "" {
-		args = append(args, "--sslCAFile="+a.Config.TLSCA)
+		args = append(args, "--ssl", "--sslCAFile="+a.Config.TLSCA)
 	}
 	return args
 }

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/ajctrl/mongodb-backup-s3/internal/storage"
+	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
 type appTestSource struct {
@@ -25,15 +26,21 @@ type appTestSource struct {
 	closed      bool
 }
 
-func (s *appTestSource) Inspect(context.Context) (Snapshot, error) {
+func (s *appTestSource) Inspect(context.Context, string) (Snapshot, error) {
 	s.inspections++
 	if s.failAfter > 0 && s.inspections >= s.failAfter {
 		return Snapshot{}, errors.New("metadata inspection failed")
 	}
 	return Snapshot{ReplicaSet: []byte(`{"_id":"rs0","members":[{"_id":0,"host":"mongo:27017"}]}`), ServerVersion: "8.0.0", FCV: "8.0"}, nil
 }
-func (s *appTestSource) Databases(context.Context) ([]string, error) { return s.names, nil }
-func (s *appTestSource) Close(context.Context) error                 { s.closed = true; return nil }
+func (s *appTestSource) primaryView() Source { return s }
+func (s *appTestSource) dumpMember(_ context.Context, uri string) (string, bson.ObjectID, error) {
+	return uri, bson.NilObjectID, nil
+}
+func (s *appTestSource) Databases(context.Context, bool, string) ([]string, error) {
+	return s.names, nil
+}
+func (s *appTestSource) Close(context.Context) error { s.closed = true; return nil }
 
 type appTestStore struct {
 	objects         map[string][]byte
@@ -952,4 +959,36 @@ func alterAppTestBundle(t *testing.T, input []byte, member string) []byte {
 		t.Fatal(err)
 	}
 	return output.Bytes()
+}
+
+type laggingFirstDatabase struct {
+	*appTestSource
+	selections int
+}
+
+func (s *laggingFirstDatabase) dumpMember(_ context.Context, uri string) (string, bson.ObjectID, error) {
+	s.selections++
+	if s.selections == 1 {
+		return "", bson.NilObjectID, errors.New("replication delayed")
+	}
+	return uri, bson.NilObjectID, nil
+}
+
+func TestSecondaryFallbackIsScopedToOneDatabase(t *testing.T) {
+	a, store, src, log := newAppTest(t, "per-database")
+	src.names = []string{"first", "second"}
+	source := &laggingFirstDatabase{appTestSource: src}
+	var warnings bytes.Buffer
+	a.Err = &warnings
+	a.newSource = func(context.Context, Config) (Source, error) { return source, nil }
+	a.Config.Database = ""
+	a.Config.Databases = src.names
+	a.Config.ReadPreference = "secondary"
+	if err := a.Backup(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	commands := readAppCommandLog(t, log)
+	if len(store.objects) != 2 || source.selections != 2 || strings.Count(commands, "--readPreference=primary\n") != 2 || strings.Count(commands, "--readPreference=secondary\n") != 2 || !strings.Contains(warnings.String(), "using the primary for this database") {
+		t.Fatalf("unexpected scoped fallback, selections=%d commands=%s", source.selections, commands)
+	}
 }

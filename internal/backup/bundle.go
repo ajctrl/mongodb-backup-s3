@@ -14,6 +14,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -24,17 +25,19 @@ type FileRecord struct {
 	SHA256 string `json:"sha256"`
 }
 type Manifest struct {
-	FormatVersion  int                   `json:"format_version"`
-	Mode           string                `json:"mode"`
-	Database       string                `json:"database,omitempty"`
-	Oplog          bool                  `json:"oplog"`
-	StartedAt      time.Time             `json:"started_at"`
-	CompletedAt    time.Time             `json:"completed_at"`
-	ServerVersion  string                `json:"server_version"`
-	FCV            string                `json:"feature_compatibility_version"`
-	ToolsVersion   string                `json:"tools_version"`
-	ConfigIncluded bool                  `json:"config_included"`
-	Files          map[string]FileRecord `json:"files"`
+	ExcludedConfigCollections []string              `json:"excluded_config_collections,omitempty"`
+	ObservedDatabases         []string              `json:"observed_databases,omitempty"`
+	FormatVersion             int                   `json:"format_version"`
+	Mode                      string                `json:"mode"`
+	Database                  string                `json:"database,omitempty"`
+	Oplog                     bool                  `json:"oplog"`
+	StartedAt                 time.Time             `json:"started_at"`
+	CompletedAt               time.Time             `json:"completed_at"`
+	ServerVersion             string                `json:"server_version"`
+	FCV                       string                `json:"feature_compatibility_version"`
+	ToolsVersion              string                `json:"tools_version"`
+	ConfigIncluded            bool                  `json:"config_included"`
+	Files                     map[string]FileRecord `json:"files"`
 }
 
 type countingHashWriter struct {
@@ -81,13 +84,22 @@ func (a *App) writeBundle(ctx context.Context, out io.Writer, r commandRunner, s
 		m.Files[name] = FileRecord{Size: w.n, SHA256: hex.EncodeToString(w.hash.Sum(nil))}
 		return nil
 	}
-	if err := add("replica-set.json", func(w io.Writer) error { _, err := w.Write(snapshot.ReplicaSet); return err }); err != nil {
-		return err
+	hasMetadata := a.Config.BackupMode != "partial" || len(snapshot.ReplicaSet) > 0
+	if hasMetadata {
+		if err := add("replica-set.json", func(w io.Writer) error { _, err := w.Write(snapshot.ReplicaSet); return err }); err != nil {
+			return err
+		}
 	}
-	if err := captureConfig(ctx, a.Config.ConfigDir, func(name string, r io.Reader) error {
-		return add(name, func(w io.Writer) error { _, err := io.Copy(w, r); return err })
+	if err := captureConfig(ctx, a.Config.ConfigDir, func(name string, r io.Reader) (string, error) {
+		err := add(name, func(w io.Writer) error { _, err := io.Copy(w, r); return err })
+		return m.Files[name].SHA256, err
 	}); err != nil {
 		return err
+	}
+	if m.Mode == "per-database" {
+		if err := checkDatabase(ctx, source, db, false); err != nil {
+			return err
+		}
 	}
 	if err := add("data.archive.gz", func(w io.Writer) error { return r.run(ctx, w, "mongodump", a.dumpArgs(db, false)...) }); err != nil {
 		return err
@@ -99,12 +111,37 @@ func (a *App) writeBundle(ctx context.Context, out io.Writer, r commandRunner, s
 			return err
 		}
 	}
-	after, err := source.Inspect(ctx)
+	after, err := source.Inspect(ctx, m.Mode)
 	if err != nil {
 		return err
 	}
+	if snapshot.ElectionID != after.ElectionID {
+		return fmt.Errorf("primary election changed during backup")
+	}
 	if !bytes.Equal(snapshot.ReplicaSet, after.ReplicaSet) || snapshot.FCV != after.FCV || snapshot.ServerVersion != after.ServerVersion {
 		return fmt.Errorf("replica set configuration or server version changed during backup")
+	}
+	// Recheck before the producer can signal EOF and S3 can publish the object.
+	switch m.Mode {
+	case "full":
+		names, err := source.Databases(ctx, false, "")
+		if err != nil {
+			return fmt.Errorf("%w: %w", errFullInventoryLost, err)
+		}
+		if err := validateFullInventory(names); err != nil {
+			return err
+		}
+		m.ObservedDatabases = names
+		excluded := append(snapshot.ExcludedConfigCollections, after.ExcludedConfigCollections...)
+		slices.Sort(excluded)
+		m.ExcludedConfigCollections = slices.Compact(excluded)
+		if len(m.ExcludedConfigCollections) > 0 {
+			fmt.Fprintf(a.Err, "Warning: full dump excludes these config database collections: %q. Recorded in manifest.\n", m.ExcludedConfigCollections)
+		}
+	case "partial", "per-database":
+		if err := checkDatabase(ctx, source, db, m.Mode == "partial"); err != nil {
+			return err
+		}
 	}
 	m.CompletedAt = a.now().UTC()
 	if err := m.validateMetadata(); err != nil {
@@ -130,8 +167,26 @@ func (a *App) writeBundle(ctx context.Context, out io.Writer, r commandRunner, s
 	return z.Close()
 }
 
+func checkDatabase(ctx context.Context, source Source, db string, authorizedOnly bool) error {
+	visible, err := source.Databases(ctx, authorizedOnly, db)
+	if err != nil {
+		return err
+	}
+	if !slices.Contains(visible, db) {
+		return fmt.Errorf("database %q is no longer visible", db)
+	}
+	return nil
+}
+
 func (m Manifest) validateMetadata() error {
-	if m.ServerVersion == "" || m.ToolsVersion == "" || m.FCV == "" || m.StartedAt.IsZero() || m.CompletedAt.IsZero() {
+	_, hasMetadata := m.Files["replica-set.json"]
+	if !hasMetadata && m.Mode != "partial" {
+		return fmt.Errorf("missing replica metadata")
+	}
+	if m.Mode != "partial" && (m.ServerVersion == "" || m.FCV == "") {
+		return fmt.Errorf("inconsistent replica metadata")
+	}
+	if m.ToolsVersion == "" || m.StartedAt.IsZero() || m.CompletedAt.IsZero() {
 		return fmt.Errorf("incomplete backup manifest")
 	}
 	if m.CompletedAt.Before(m.StartedAt) {
@@ -187,11 +242,11 @@ func validateBundle(ctx context.Context, z *zip.ReadCloser, c Config) (Manifest,
 	if err := m.validateMetadata(); err != nil {
 		return m, err
 	}
-	if files["data.archive.gz"] == nil || files["replica-set.json"] == nil || (m.Mode == "per-database" && files["auth.archive.gz"] == nil) {
+	if files["data.archive.gz"] == nil || (m.Mode == "per-database" && files["auth.archive.gz"] == nil) {
 		return m, fmt.Errorf("backup is missing required components")
 	}
-	if m.Mode == "full" && files["auth.archive.gz"] != nil {
-		return m, fmt.Errorf("unexpected authentication archive in full bundle")
+	if m.Mode != "per-database" && files["auth.archive.gz"] != nil {
+		return m, fmt.Errorf("unexpected authentication archive in %s bundle", m.Mode)
 	}
 	if len(m.Files) != len(files)-1 {
 		return m, fmt.Errorf("backup manifest file inventory mismatch")

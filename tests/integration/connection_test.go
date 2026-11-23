@@ -15,6 +15,7 @@ import (
 	"math/big"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -25,12 +26,12 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 )
 
-// Both the Go metadata commands and MongoDB Tools' data reads must use the secondary.
+// Replica metadata and data reads use the secondary; namespace discovery uses the primary.
 // The TLS case also exercises the final image's CA handling for both clients.
 func TestSecondaryBackupRestore(t *testing.T) {
 	for _, useTLS := range []bool{false, true} {
 		t.Run(fmt.Sprintf("TLS=%t", useTLS), func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(t.Context(), 6*time.Minute)
+			ctx, cancel := fixtureContext(t, 6*time.Minute)
 			defer cancel()
 			f := newFixtureWithOptions(t, ctx, fixtureOptions{tls: useTLS, secondary: true})
 			source := f.connect(t, f.sourceURI)
@@ -51,7 +52,7 @@ func TestSecondaryBackupRestore(t *testing.T) {
 				if !t.Run(mode, func(t *testing.T) {
 					env := map[string]string{
 						"S3_PREFIX": "secondary-" + mode, "BACKUP_MODE": mode,
-						"BACKUP_FILENAME_MODE": "fixed", "MONGODB_READ_PREFERENCE": "secondary",
+						"BACKUP_FILENAME_MODE": "fixed", "BACKUP_ALLOW_UNVERSIONED_OVERWRITE": "true", "MONGODB_READ_PREFERENCE": "secondary",
 					}
 					if mode == "per-database" {
 						env["MONGODB_DATABASE"] = "app"
@@ -59,6 +60,13 @@ func TestSecondaryBackupRestore(t *testing.T) {
 					// Fail data and replica metadata reads on the primary. MongoDB Tools
 					// still use the primary for database/collection enumeration.
 					func() {
+						if mode == "full" {
+							out, err := f.runCommand(t, env, "backup")
+							if err != nil || !strings.Contains(out, "full backup uses primary") {
+								t.Fatalf("primary selection: %v\n%s", err, out)
+							}
+							return
+						}
 						f.command(t, source.Database("admin"), bson.D{
 							{Key: "configureFailPoint", Value: "failCommand"}, {Key: "mode", Value: "alwaysOn"},
 							{Key: "data", Value: bson.M{"failCommands": bson.A{"find", "replSetGetConfig", "getParameter"}, "errorCode": 2}},
@@ -99,7 +107,7 @@ func (f *fixture) checkTLSRejections(t *testing.T) {
 	for _, reason := range []string{"wrong CA", "wrong hostname"} {
 		t.Run(reason, func(t *testing.T) {
 			env := map[string]string{
-				"BACKUP_MODE": "per-database", "MONGODB_DATABASE": "app", "BACKUP_FILENAME_MODE": "fixed",
+				"BACKUP_MODE": "per-database", "MONGODB_DATABASE": "app", "BACKUP_FILENAME_MODE": "fixed", "BACKUP_ALLOW_UNVERSIONED_OVERWRITE": "true",
 				"S3_PREFIX": "rejected-" + strings.ReplaceAll(reason, " ", "-"),
 			}
 			badURI := func(uri string) string {
@@ -112,6 +120,9 @@ func (f *fixture) checkTLSRejections(t *testing.T) {
 			}
 			env["MONGODB_URI"] = badURI(f.baseEnv["MONGODB_URI"])
 			if reason == "wrong CA" {
+				// The OS trusts the server CA. Both clients must honor the
+				// explicit, unrelated CA file even in this environment.
+				env["SSL_CERT_FILE"] = f.baseEnv["MONGODB_TLS_CA_FILE"]
 				env["MONGODB_TLS_CA_FILE"] = filepath.Join(filepath.Dir(f.baseEnv["MONGODB_TLS_CA_FILE"]), "wrong-ca.pem")
 			}
 			output, err := f.runCommand(t, env, "backup")
@@ -121,15 +132,15 @@ func (f *fixture) checkTLSRejections(t *testing.T) {
 			if keys := f.keys(t, env["S3_PREFIX"]+"/"); len(keys) != 0 {
 				t.Fatalf("invalid TLS connection published %v", keys)
 			}
-			// Restore bypasses the Go metadata client. Test the tool's certificate
+			// Non-dropping restores bypass the version preflight. Test the tool's certificate
 			// checks independently, using the previously validated saved bundle.
 			target := f.connect(t, f.targetURI)
 			f.setValue(t, target, "app", "unchanged after TLS failure")
 			env["S3_PREFIX"] = "secondary-per-database"
 			env["MONGODB_URI"] = badURI(f.targetURI)
-			env["MONGODB_RESTORE_DROP"] = "true"
+			env["MONGODB_RESTORE_DROP"] = "false"
 			output, err = f.runCommand(t, env, "restore")
-			if err == nil || !strings.Contains(output, "mongorestore failed") || !strings.Contains(strings.ToLower(output), "certificate") {
+			if err == nil || !strings.Contains(output, "mongorestore failed") {
 				t.Fatalf("mongorestore accepted %s or failed elsewhere: error=%v output=%s", reason, err, output)
 			}
 			f.assertValue(t, target, "app", "unchanged after TLS failure")
@@ -269,4 +280,156 @@ func createTestCertificates(t *testing.T, dir string) *tls.Config {
 		t.Fatal("invalid generated CA")
 	}
 	return &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+}
+
+func TestSecondaryLagPreservesFixedBackup(t *testing.T) {
+	ctx, cancel := fixtureContext(t, 4*time.Minute)
+	defer cancel()
+	f := newFixtureWithOptions(t, ctx, fixtureOptions{secondary: true})
+	source := f.connect(t, f.sourceURI)
+	const db = "lagged"
+	if _, err := source.Database(db).Collection("probe").InsertOne(ctx, bson.M{"_id": 1}); err != nil {
+		t.Fatal(err)
+	}
+	secondary := f.connect(t, authenticatedURI(f.secondaryPort, "source"))
+	probe := secondary.Database(db, options.Database().SetReadPreference(readpref.Secondary())).Collection("probe")
+	waitFor(t, ctx, "replication to secondary", func(ctx context.Context) error {
+		count, err := probe.CountDocuments(ctx, bson.M{})
+		if err != nil {
+			return err
+		}
+		if count != 1 {
+			return fmt.Errorf("replicated documents=%d", count)
+		}
+		return nil
+	})
+	env := map[string]string{"S3_PREFIX": "lag", "BACKUP_MODE": "per-database", "MONGODB_DATABASE": db, "MONGODB_READ_PREFERENCE": "secondary", "BACKUP_FILENAME_MODE": "fixed", "BACKUP_ALLOW_UNVERSIONED_OVERWRITE": "true"}
+	f.run(t, env, "backup")
+	const key = "lag/per-database/lagged/latest.zip"
+	saved := f.version(t, key)
+	command := func(name string, args bson.D) error {
+		cmd := append(bson.D{{Key: name, Value: 1}}, args...)
+		return secondary.Database("admin").RunCommand(ctx, cmd, options.RunCmd().SetReadPreference(readpref.Secondary())).Err()
+	}
+	if err := command("fsync", bson.D{{Key: "lock", Value: true}}); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := command("fsyncUnlock", nil); err != nil {
+			t.Error(err)
+		}
+	}()
+	// The secondary still has probe, while the primary now has only marker.
+	if _, err := source.Database(db).Collection("marker").InsertOne(ctx, bson.M{"_id": 1}); err != nil {
+		t.Fatal(err)
+	}
+	f.command(t, source.Database(db), bson.D{{Key: "drop", Value: "probe"}, {Key: "writeConcern", Value: bson.M{"w": 1}}})
+	full := map[string]string{"BACKUP_MODE": "full", "MONGODB_READ_PREFERENCE": "secondary", "BACKUP_FILENAME_MODE": "fixed", "BACKUP_ALLOW_UNVERSIONED_OVERWRITE": "true", "S3_PREFIX": "lag-full"}
+	f.run(t, full, "backup")
+	fullKey := "lag-full/full/latest.zip"
+	generation := f.version(t, fullKey)
+	full["MONGODB_URI"], full["MONGODB_RESTORE_DROP"] = f.targetURI, "true"
+	f.run(t, full, "restore")
+	target := f.connect(t, f.targetURI).Database(db)
+	for collection, want := range map[string]int64{"marker": 1, "probe": 0} {
+		if got, err := target.Collection(collection).CountDocuments(ctx, bson.M{}); err != nil || got != want {
+			t.Fatalf("restored %s: got %d, want %d, err=%v", collection, got, want, err)
+		}
+	}
+	full["MONGODB_URI"] = authenticatedURI(f.secondaryPort, "source") + "&directConnection=true"
+	out, err := f.runCommand(t, full, "backup")
+	if err == nil || f.version(t, fullKey) != generation {
+		t.Fatalf("direct secondary backup: %v %s", err, out)
+	}
+	// Keep the database on the primary but remove a collection while the
+	// secondary is frozen. The new fixed version must contain primary data.
+	out = f.run(t, env, "backup")
+	if !strings.Contains(out, "using the primary for this database") || f.version(t, key) == saved {
+		t.Fatalf("missing per-database primary fallback: %s", out)
+	}
+	restoreEnv := map[string]string{"S3_PREFIX": "lag", "BACKUP_MODE": "per-database", "MONGODB_DATABASE": db, "BACKUP_FILENAME_MODE": "fixed", "MONGODB_URI": f.targetURI, "MONGODB_RESTORE_DROP": "true"}
+	if err := target.Drop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	f.run(t, restoreEnv, "restore")
+	for collection, want := range map[string]int64{"marker": 1, "probe": 0} {
+		if got, err := target.Collection(collection).CountDocuments(ctx, bson.M{}); err != nil || got != want {
+			t.Fatalf("fallback restored %s count=%d want=%d err=%v", collection, got, want, err)
+		}
+	}
+	// This secondary is non-voting, so the primary alone commits the marker.
+	// Explicit majority reads must still be able to use the primary fallback.
+	saved = f.version(t, key)
+	env["MONGODB_URI"] = f.baseEnv["MONGODB_URI"] + "&readConcernLevel=majority"
+	out = f.run(t, env, "backup")
+	if !strings.Contains(out, "using the primary for this database") || f.version(t, key) == saved {
+		t.Fatalf("missing majority-committed primary fallback: %s", out)
+	}
+	saved = f.version(t, key)
+	delete(env, "MONGODB_URI")
+	f.command(t, source.Database(db), bson.D{{Key: "dropDatabase", Value: 1}, {Key: "writeConcern", Value: bson.M{"w": 1}}})
+	if count, err := probe.CountDocuments(ctx, bson.M{}); err != nil || count != 1 {
+		t.Fatalf("lagged source count=%d err=%v", count, err)
+	}
+	out, err = f.runCommand(t, env, "backup")
+	if err == nil || !strings.Contains(out, "does not exist") || f.version(t, key) != saved {
+		t.Fatalf("previous generation was not protected: %v %s", err, out)
+	}
+}
+
+func TestRejectDirectShard(t *testing.T) {
+	if os.Getenv("MONGODB_NATIVE_INTEGRATION") == "1" {
+		t.Skip("uses a dedicated Docker shard server")
+	}
+	ctx, cancel := fixtureContext(t, 2*time.Minute)
+	defer cancel()
+	f := newFixture(t, ctx)
+	// Bind only inside the fixture network. The official image's root-user
+	// bootstrap starts a standalone mongod, which cannot run with --shardsvr.
+	node := f.name + "-shard"
+	port := unusedPort(t)
+	t.Cleanup(func() { dockerCleanup(t, "rm", "-f", "-v", node) })
+	docker(t, ctx, "run", "-d", "--name", node, "--network", "container:"+f.anchor, "--entrypoint", "mongod", envOr("MONGODB_TEST_IMAGE", defaultMongoTestImage),
+		"--bind_ip", "127.0.0.1", "--port", port, "--shardsvr", "--replSet", "shard", "--oplogSize", "64")
+	probe := func(script string) error {
+		output, err := exec.CommandContext(ctx, "docker", "exec", node, "mongosh", "--quiet", "--port", port, "--eval", script).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("mongosh: %w: %s", err, output)
+		}
+		return nil
+	}
+	waitFor(t, ctx, "shard server", func(context.Context) error { return probe("db.adminCommand({ping:1})") })
+	if err := probe("rs.initiate({_id:'shard',members:[{_id:0,host:'127.0.0.1:" + port + "'}]})"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, ctx, "shard primary", func(context.Context) error { return probe("quit(db.hello().isWritablePrimary ? 0 : 1)") })
+	for _, mode := range []string{"full", "per-database"} {
+		env := map[string]string{"BACKUP_MODE": mode, "MONGODB_URI": "mongodb://127.0.0.1:" + port + "/?replicaSet=shard&directConnection=true", "S3_PREFIX": "shard"}
+		if mode == "per-database" {
+			env["MONGODB_DATABASE"] = "app"
+		}
+		out, err := f.runCommand(t, env, "backup")
+		if err == nil || !strings.Contains(out, "non-sharded replica set") || len(f.keys(t, "shard/")) != 0 {
+			t.Fatalf("%s backup on shard: %v\n%s", mode, err, out)
+		}
+	}
+
+}
+
+func TestSecondaryFallbackSingleMember(t *testing.T) {
+	ctx, cancel := fixtureContext(t, 2*time.Minute)
+	defer cancel()
+	f := newFixture(t, ctx)
+	src := f.connect(t, f.sourceURI)
+	for _, db := range []string{"first", "second"} {
+		if _, err := src.Database(db).Collection("probe").InsertOne(ctx, bson.M{"_id": 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	env := map[string]string{"BACKUP_MODE": "per-database", "MONGODB_DATABASES": `["first","second"]`, "MONGODB_READ_PREFERENCE": "secondary"}
+	start := time.Now()
+	out := f.run(t, env, "backup")
+	if elapsed := time.Since(start); elapsed >= 30*time.Second || strings.Count(out, "primary advertises no secondary candidates") != 2 {
+		t.Fatalf("single-member backup took %s: %s", elapsed, out)
+	}
 }

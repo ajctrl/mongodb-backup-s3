@@ -12,10 +12,11 @@ import (
 )
 
 type commandRunner struct {
-	defaultsFile   string
-	passphraseFile string
-	stderr         io.Writer
-	lock           *os.File
+	authMechanism string
+	defaults      string
+	passphrase    string
+	stderr        io.Writer
+	lock          *os.File
 }
 
 func (r commandRunner) run(ctx context.Context, stdout io.Writer, name string, args ...string) error {
@@ -36,27 +37,33 @@ func (r commandRunner) runInput(ctx context.Context, stdin io.Reader, stdout io.
 }
 
 func (r commandRunner) command(ctx context.Context, name string, args ...string) (*exec.Cmd, func(), error) {
-	if name == "mongorestore" || name == "mongodump" {
-		args = append([]string{"--config=" + r.defaultsFile}, args...)
-	}
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Stderr = r.stderr
-	cmd.Env = childEnvironment()
+	authMechanism := ""
+	if name == "mongodump" || name == "mongorestore" {
+		authMechanism = r.authMechanism
+	}
+	cmd.Env = childEnvironment(authMechanism)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if r.lock != nil {
 		// The dump/encryption child keeps the lock if the parent is killed abruptly.
 		cmd.ExtraFiles = []*os.File{r.lock}
 	}
 	closeFiles := func() {}
-	if name == "gpg" {
-		// Each invocation gets an independent offset, including repeated DB dumps.
-		file, err := os.Open(r.passphraseFile)
-		if err != nil {
-			return nil, nil, fmt.Errorf("open GPG passphrase file: %w", err)
-		}
+	if name == "gpg" || name == "mongorestore" || name == "mongodump" {
+		secret := r.defaults
 		fd := 3 + len(cmd.ExtraFiles)
+		flags := []string{fmt.Sprintf("--config=/proc/self/fd/%d", fd)}
+		if name == "gpg" {
+			secret = r.passphrase
+			flags = []string{"--passphrase-fd", fmt.Sprint(fd)}
+		}
+		file, err := anonymousSecret(secret)
+		if err != nil {
+			return nil, nil, err
+		}
 		cmd.ExtraFiles = append(cmd.ExtraFiles, file)
-		cmd.Args = append([]string{cmd.Args[0], "--passphrase-fd", fmt.Sprint(fd)}, args...)
+		cmd.Args = append(append(cmd.Args[:1:1], flags...), args...)
 		closeFiles = func() { file.Close() }
 	}
 	cmd.Cancel = func() error {
@@ -67,6 +74,36 @@ func (r commandRunner) command(ctx context.Context, name string, args ...string)
 		return err
 	}
 	return cmd, closeFiles, nil
+}
+
+// Unlink before writing credentials or backup bytes. The kernel reclaims the
+// contents when the last descriptor closes, even if the process is killed.
+func anonymousFile() (*os.File, error) {
+	f, err := os.CreateTemp("", "mongodb-backup-s3-fd-")
+	if err != nil {
+		return nil, err
+	}
+	if err := os.Remove(f.Name()); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
+}
+
+func anonymousSecret(secret string) (*os.File, error) {
+	f, err := anonymousFile()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := f.WriteString(secret); err != nil {
+		f.Close()
+		return nil, err
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
 }
 
 func commandError(ctx context.Context, name string, err error) error {
@@ -80,11 +117,14 @@ func commandError(ctx context.Context, name string, err error) error {
 	return nil
 }
 
-func childEnvironment() []string {
+func childEnvironment(authMechanism string) []string {
 	var result []string
 	for _, entry := range os.Environ() {
 		key, _, _ := strings.Cut(entry, "=")
-		if strings.HasPrefix(key, "MONGODB_") || key == "PASSPHRASE" {
+		// The Kubernetes OIDC provider on EKS only reads the token file path.
+		allowAWS := authMechanism == "MONGODB-AWS" || (authMechanism == "MONGODB-OIDC" && key == "AWS_WEB_IDENTITY_TOKEN_FILE")
+		if strings.HasPrefix(key, "S3_") || (!allowAWS && strings.HasPrefix(key, "AWS_")) ||
+			strings.HasPrefix(key, "MONGODB_") || key == "PASSPHRASE" {
 			continue
 		}
 		result = append(result, entry)

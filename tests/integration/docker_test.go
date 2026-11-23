@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -78,6 +79,37 @@ func TestBackupRestore(t *testing.T) {
 			f.assertAuth(t, "app", "appreader")
 		})
 	}
+
+	t.Run("disclose_excluded_config_collections", func(t *testing.T) {
+		config := source.Database("config").Collection("businessArchive")
+		if _, err := config.InsertOne(ctx, bson.M{"_id": 1}); err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if err := config.Drop(ctx); err != nil {
+				t.Error(err)
+			}
+		}()
+		env := map[string]string{"S3_PREFIX": "config-warning", "BACKUP_FILENAME_MODE": "fixed", "BACKUP_ALLOW_UNVERSIONED_OVERWRITE": "true"}
+		out := f.run(t, env, "backup")
+		if !strings.Contains(out, "businessArchive") || !strings.Contains(out, "Backup complete: full") {
+			t.Fatal(out)
+		}
+		// outputPath itself is the extraction destination used by the fixture;
+		// its parent is the host-mounted output directory.
+		dest := filepath.Join(filepath.Dir(f.outputPath), "config-inspect")
+		f.run(t, env, "extract-config", dest)
+		contents, err := os.ReadFile(filepath.Join(f.outputDir, "config-inspect", "manifest.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var manifest struct {
+			Excluded []string `json:"excluded_config_collections"`
+		}
+		if err := json.Unmarshal(contents, &manifest); err != nil || !slices.Equal(manifest.Excluded, []string{"businessArchive"}) {
+			t.Fatalf("manifest exclusions %q err=%v", manifest.Excluded, err)
+		}
+	})
 
 	t.Run("conditional_writes_preserve_existing_generation", func(t *testing.T) {
 		store, err := storage.New(ctx, storage.Config{Bucket: f.bucket, Region: "us-east-1", Endpoint: f.endpoint,
@@ -373,6 +405,20 @@ func TestBackupRestore(t *testing.T) {
 			t.Fatal("failed backup replaced the previously successful object")
 		}
 	})
+	t.Run("reserved_name_preserves_full_generation", func(t *testing.T) {
+		env := map[string]string{"S3_PREFIX": "reserved-db", "BACKUP_FILENAME_MODE": "fixed", "BACKUP_ALLOW_UNVERSIONED_OVERWRITE": "true"}
+		f.run(t, env, "backup")
+		const key = "reserved-db/full/latest.zip"
+		saved := f.version(t, key)
+		if err := source.Database("__mdb_internal_reports").CreateCollection(ctx, "reports"); err != nil {
+			t.Fatal(err)
+		}
+		output, err := f.runCommand(t, env, "backup")
+		if err == nil || !strings.Contains(output, "mongodump excludes database") || f.version(t, key) != saved {
+			t.Fatalf("reserved DB backup: %v %s", err, output)
+		}
+	})
+
 }
 
 type fixture struct {

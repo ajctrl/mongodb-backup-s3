@@ -1,9 +1,9 @@
 package backup
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -14,9 +14,9 @@ import (
 )
 
 // captureConfig adds regular files to a generation bundle. add must consume the
-// entire reader before returning. Source permissions are deliberately not used
+// entire reader and return its hexadecimal SHA-256 digest. Source permissions are deliberately not used
 // for extraction: restored files containing credentials must remain private.
-func captureConfig(ctx context.Context, dir string, add func(name string, r io.Reader) error) error {
+func captureConfig(ctx context.Context, dir string, add func(name string, r io.Reader) (string, error)) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -76,18 +76,18 @@ func captureConfig(ctx context.Context, dir string, add func(name string, r io.R
 	if len(files) == 0 {
 		return errors.New("MONGODB_CONFIG_DIR contains no regular files")
 	}
-	hashes := make(map[string][]byte, len(files))
+	hashes := make(map[string]string, len(files))
 	for _, file := range files {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		h := sha256.New()
 		if err := captureConfigFile(ctx, root, file.name, file.info, func(name string, r io.Reader) error {
-			return add(name, io.TeeReader(r, h))
+			digest, err := add(name, r)
+			hashes[file.name] = digest
+			return err
 		}); err != nil {
 			return err
 		}
-		hashes[file.name] = h.Sum(nil)
 	}
 	// Compare the inventory as well as metadata: directory size and mtime can
 	// remain unchanged when an entry is added within one filesystem clock tick.
@@ -114,7 +114,7 @@ func captureConfig(ctx context.Context, dir string, add func(name string, r io.R
 			}); err != nil {
 				return err
 			}
-			if !bytes.Equal(hashes[name], h.Sum(nil)) {
+			if hashes[name] != hex.EncodeToString(h.Sum(nil)) {
 				return fmt.Errorf("config file %q changed during backup", name)
 			}
 		}
