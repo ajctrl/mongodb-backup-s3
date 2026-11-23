@@ -484,6 +484,15 @@ func TestS3CredentialOverridesAndDefaultChain(t *testing.T) {
 	}
 }
 
+func TestS3VersioningWithoutStatus(t *testing.T) {
+	s := testS3(t, func(w http.ResponseWriter, r *http.Request) {
+		writeXML(w, "<VersioningConfiguration/>")
+	})
+	if enabled, err := s.VersioningEnabled(t.Context()); err != nil || enabled {
+		t.Fatalf("empty versioning status = %v, %v", enabled, err)
+	}
+}
+
 func TestS3DisabledVersioningAndCancellation(t *testing.T) {
 	s := testS3(t, func(w http.ResponseWriter, r *http.Request) {
 		writeXML(w, `<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>`)

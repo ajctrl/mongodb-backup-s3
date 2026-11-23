@@ -224,6 +224,28 @@ func TestBackupRestore(t *testing.T) {
 	}
 
 	target := f.connect(t, f.targetURI)
+	t.Run("restore_timestamp_fallback_from_unversioned_bucket", func(t *testing.T) {
+		bucket := f.bucket + "-unversioned"
+		if _, err := f.s3.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
+			t.Fatal(err)
+		}
+		env := map[string]string{
+			"S3_BUCKET": bucket, "BACKUP_MODE": "per-database", "MONGODB_DATABASE": "analytics",
+			"BACKUP_FILENAME_MODE": "fixed", "BACKUP_ALLOW_UNVERSIONED_OVERWRITE": "false",
+		}
+		log := f.run(t, env, "backup")
+		_, args, ok := strings.Cut(log, "set BACKUP_FILENAME_MODE=timestamp and run mongodb-backup-s3 restore ")
+		generation, _, _ := strings.Cut(args, "\n")
+		if !ok || generation == "" {
+			t.Fatalf("missing timestamp restore command: %s", log)
+		}
+		env["MONGODB_URI"] = f.targetURI
+		env["BACKUP_FILENAME_MODE"] = "timestamp"
+		env["MONGODB_RESTORE_DROP"] = "true"
+		f.setValue(t, target, "analytics", "before fallback restore")
+		f.run(t, env, "restore", generation)
+		f.assertValue(t, target, "analytics", "analytics original")
+	})
 	if !t.Run("per_database_data_and_explicit_auth_restore", func(t *testing.T) {
 		env := map[string]string{
 			"S3_PREFIX": "selected", "BACKUP_MODE": "per-database", "BACKUP_FILENAME_MODE": "fixed",

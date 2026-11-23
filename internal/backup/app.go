@@ -92,7 +92,9 @@ func withWorkspace(action func(string) error) (err error) {
 	return action(dir)
 }
 
-func (a *App) Backup(ctx context.Context) error {
+// Each run gets a copy of Config so its effective filename mode applies to all
+// databases in this run. Scheduled runs check the configured mode afresh.
+func (a App) Backup(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -107,13 +109,20 @@ func (a *App) Backup(ctx context.Context) error {
 	defer lock.Close()
 	if a.Config.FilenameMode == "fixed" {
 		enabled, err := a.Store.VersioningEnabled(ctx)
-		if err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err != nil || !enabled {
+			reason := "S3 bucket versioning is not Enabled"
+			if err != nil {
+				reason = fmt.Sprintf("could not verify S3 bucket versioning (%q)", err.Error())
 			}
-			return fmt.Errorf("could not verify S3 bucket versioning; fixed backup refused: %w", err)
-		} else if !enabled {
-			return fmt.Errorf("fixed filenames require S3 bucket versioning to be Enabled")
+			if a.Config.AllowUnversionedOverwrite {
+				fmt.Fprintf(a.Err, "Warning: %s. BACKUP_ALLOW_UNVERSIONED_OVERWRITE=true permits overwriting the fixed key and may replace the previous backup.\n", reason)
+			} else {
+				fmt.Fprintf(a.Err, "Warning: %s. Using timestamp filenames for this run and leaving the fixed key untouched.\n", reason)
+				a.Config.FilenameMode = "timestamp"
+			}
 		}
 	}
 	source, err := a.newSource(ctx, a.Config)
@@ -150,7 +159,11 @@ func (a *App) Backup(ctx context.Context) error {
 				failures = append(failures, err)
 				continue
 			}
-			fmt.Fprintf(a.Out, "Backup complete: %s\n", a.label(db))
+			fmt.Fprintf(a.Out, "Backup complete: %s (key: %q)\n", a.label(db), key)
+			if a.Config.FilenameMode == "timestamp" {
+				generation := strings.TrimSuffix(strings.TrimPrefix(key, a.Config.timestampPrefix(db)), a.Config.fileType())
+				fmt.Fprintf(a.Out, "To restore %s using your existing restore setup, set BACKUP_FILENAME_MODE=timestamp and run mongodb-backup-s3 restore %s\n", a.label(db), generation)
+			}
 			if days > 0 {
 				if err := a.removeOldBackups(ctx, db, key, started, a.now().UTC(), days); err != nil {
 					failures = append(failures, err)

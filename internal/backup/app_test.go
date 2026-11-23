@@ -42,6 +42,7 @@ type appTestStore struct {
 	uploads         int
 	lists           int
 	versions        bool
+	versionChecks   int
 	versionErr      error
 	lastUploadedKey string
 	allowOverwrite  bool
@@ -52,6 +53,7 @@ type appTestStore struct {
 }
 
 func (s *appTestStore) VersioningEnabled(context.Context) (bool, error) {
+	s.versionChecks++
 	return s.versions, s.versionErr
 }
 func (s *appTestStore) Upload(ctx context.Context, key string, body io.ReadCloser, allowOverwrite bool) error {
@@ -324,31 +326,135 @@ func TestBackupAndRestoreToolModes(t *testing.T) {
 	}
 }
 
-func TestFixedBackupRequiresVerifiedVersioning(t *testing.T) {
-	for _, state := range []string{"disabled", "unavailable", "enabled"} {
-		t.Run(state, func(t *testing.T) {
-			a, store, source, log := newAppTest(t, "full")
-			a.Config.FilenameMode = "fixed"
-			store.versions = state == "enabled"
-			if state == "unavailable" {
-				store.versionErr = errors.New("AccessDenied")
+func TestBackupFilenamePolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name, mode                string
+		enabled, allow, wantFixed bool
+		checkErr                  error
+		wantWarning               string
+	}{
+		{"enabled", "fixed", true, false, true, nil, ""},
+		{"enabled with override", "fixed", true, true, true, nil, ""},
+		{"disabled", "fixed", false, false, false, nil, "not Enabled"},
+		{"disabled with override", "fixed", false, true, true, nil, "not Enabled"},
+		{"denied", "fixed", false, false, false, errors.New("AccessDenied"), "AccessDenied"},
+		{"network error with override", "fixed", false, true, true, errors.New("connection reset"), "connection reset"},
+		{"timestamp", "timestamp", true, false, false, nil, ""},
+		{"timestamp with override", "timestamp", true, true, false, nil, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a, store, _, _ := newAppTest(t, "full")
+			var output, warnings bytes.Buffer
+			a.Out, a.Err = &output, &warnings
+			a.Config.FilenameMode, a.Config.AllowUnversionedOverwrite = tc.mode, tc.allow
+			store.versions, store.versionErr = tc.enabled, tc.checkErr
+			fixed := a.Config.fixedKey("")
+			store.objects[fixed] = []byte("previous backup")
+			if err := a.Backup(t.Context()); err != nil {
+				t.Fatal(err)
 			}
-			key := a.Config.fixedKey("")
-			store.objects[key] = []byte("previous backup")
-			err := a.Backup(t.Context())
-			if state == "enabled" {
-				if err != nil || !store.allowOverwrite || bytes.Equal(store.objects[key], []byte("previous backup")) {
-					t.Fatalf("verified fixed backup failed: %v", err)
+			wantChecks := 0
+			if tc.mode == "fixed" {
+				wantChecks = 1
+			}
+			key := store.lastUploadedKey
+			if store.versionChecks != wantChecks || store.uploads != 1 || store.allowOverwrite != tc.wantFixed {
+				t.Fatalf("checks=%d uploads=%d overwrite=%v", store.versionChecks, store.uploads, store.allowOverwrite)
+			}
+			if tc.wantFixed {
+				if key != fixed || string(store.objects[fixed]) == "previous backup" {
+					t.Fatalf("expected fixed key %q to be updated, uploaded %q", fixed, key)
 				}
-				return
+			} else if !a.Config.isTimestampBackup("", key) || string(store.objects[fixed]) != "previous backup" {
+				t.Fatalf("expected a new generation alongside the previous fixed backup, uploaded %q", key)
 			}
-			if err == nil || store.uploads != 0 || source.inspections != 0 || store.lists != 0 || readAppCommandLog(t, log) != "" || string(store.objects[key]) != "previous backup" {
-				t.Fatalf("unverified versioning allowed backup: err=%v uploads=%d", err, store.uploads)
+			if !strings.Contains(output.String(), fmt.Sprintf("Backup complete: full replica set (key: %q)", key)) {
+				t.Fatalf("success log omitted uploaded key: %s", &output)
 			}
-			if store.versionErr != nil && !errors.Is(err, store.versionErr) {
-				t.Fatalf("lost verification cause: %v", err)
+			if tc.wantWarning == "" {
+				if warnings.Len() != 0 {
+					t.Fatalf("unexpected warning: %s", &warnings)
+				}
+			} else {
+				action := "Using timestamp filenames"
+				if tc.wantFixed {
+					action = "BACKUP_ALLOW_UNVERSIONED_OVERWRITE=true"
+				}
+				for _, want := range []string{"Warning:", tc.wantWarning, action} {
+					if !strings.Contains(warnings.String(), want) {
+						t.Fatalf("warning missing %q: %s", want, &warnings)
+					}
+				}
 			}
 		})
+	}
+}
+
+func TestFallbackRestoresLoggedGenerationAndRechecksNextRun(t *testing.T) {
+	a, store, source, _ := newAppTest(t, "per-database")
+	var output bytes.Buffer
+	a.Out = &output
+	a.Config.FilenameMode = "fixed"
+	a.Config.Passphrase = "unit gpg passphrase"
+	a.Config.Database = ""
+	a.Config.Databases = []string{"app", "analytics"}
+	store.versions = false
+	a.newSource = func(context.Context, Config) (Source, error) {
+		if store.versionChecks != 1 {
+			t.Fatalf("versioning checks before MongoDB access: %d", store.versionChecks)
+		}
+		return source, nil
+	}
+	if err := a.Backup(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.objects) != 2 || store.versionChecks != 1 {
+		t.Fatalf("objects=%d versioning checks=%d", len(store.objects), store.versionChecks)
+	}
+	for _, db := range a.Config.Databases {
+		restore := *a
+		restore.Config.Database, restore.Config.Databases = db, nil
+		prefix := fmt.Sprintf("To restore %q using your existing restore setup, set BACKUP_FILENAME_MODE=timestamp and run mongodb-backup-s3 restore ", db)
+		_, tail, ok := strings.Cut(output.String(), prefix)
+		generation, _, _ := strings.Cut(tail, "\n")
+		if !ok || !validGeneration(generation) {
+			t.Fatalf("missing restore hint with a valid generation for %q: %s", db, &output)
+		}
+		restore.Config.FilenameMode = "timestamp"
+		if err := restore.Restore(t.Context(), []string{generation}); err != nil {
+			t.Fatal(err)
+		}
+		if want := a.Config.timestampPrefix(db) + generation + ".zip.gpg"; store.downloadedKey != want {
+			t.Fatalf("downloaded %q, want %q", store.downloadedKey, want)
+		}
+	}
+	store.versions = true
+	a.newSource = func(context.Context, Config) (Source, error) { return source, nil }
+	if err := a.Backup(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if store.versionChecks != 2 || len(store.objects) != 4 {
+		t.Fatalf("second run: checks=%d objects=%d", store.versionChecks, len(store.objects))
+	}
+	for _, db := range a.Config.Databases {
+		if len(store.objects[a.Config.fixedKey(db)]) == 0 {
+			t.Fatalf("second run did not update fixed key for %q", db)
+		}
+	}
+}
+
+func TestFallbackUploadFailure(t *testing.T) {
+	a, store, _, _ := newAppTest(t, "full")
+	var output bytes.Buffer
+	a.Out = &output
+	a.Config.FilenameMode = "fixed"
+	store.versions = false
+	store.uploadErr = errors.New("upload failed")
+	if err := a.Backup(t.Context()); !errors.Is(err, store.uploadErr) {
+		t.Fatalf("expected upload failure, got %v", err)
+	}
+	if store.uploads != 1 || len(store.objects) != 0 || strings.Contains(output.String(), "Backup complete") || strings.Contains(output.String(), "mongodb-backup-s3 restore") {
+		t.Fatalf("failed upload reported as saved: %s", &output)
 	}
 }
 

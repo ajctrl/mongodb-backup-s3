@@ -19,6 +19,27 @@ func testConfig(t *testing.T, values map[string]string) Config {
 	return c
 }
 
+func TestAllowUnversionedOverwriteConfig(t *testing.T) {
+	const key = "BACKUP_ALLOW_UNVERSIONED_OVERWRITE"
+	values := map[string]string{"S3_BUCKET": "bucket"}
+	if testConfig(t, values).AllowUnversionedOverwrite {
+		t.Fatal("unversioned overwrite enabled by default")
+	}
+	for _, value := range []string{"true", "false"} {
+		values[key] = value
+		if testConfig(t, values).AllowUnversionedOverwrite != (value == "true") {
+			t.Fatalf("incorrect handling of %s=%q", key, value)
+		}
+	}
+	for _, value := range []string{"", "TRUE", "1", "yes", "false "} {
+		values[key] = value
+		_, err := loadConfig(func(k string) (string, bool) { v, ok := values[k]; return v, ok })
+		if err == nil || !strings.Contains(err.Error(), key) {
+			t.Fatalf("%s=%q: expected a configuration error, got %v", key, value, err)
+		}
+	}
+}
+
 func TestRestoreWriteConcern(t *testing.T) {
 	for _, tc := range []struct {
 		query string

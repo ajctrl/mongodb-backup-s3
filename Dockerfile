@@ -52,7 +52,8 @@ ENV PATH=/usr/local/bin:/usr/bin:/bin \
     SCHEDULE="" \
     PASSPHRASE="" \
     BACKUP_KEEP_DAYS="" \
-    BACKUP_FILENAME_MODE=timestamp
+    BACKUP_FILENAME_MODE=timestamp \
+    BACKUP_ALLOW_UNVERSIONED_OVERWRITE=false
 
 COPY LICENSE LICENSE.txt /usr/share/licenses/mongodb-backup-s3/
 CMD ["mongodb-backup-s3", "run"]

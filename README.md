@@ -73,6 +73,7 @@ services:
       SCHEDULE: "CRON_TZ=Asia/Tokyo 0 2 * * *"
       BACKUP_KEEP_DAYS: "7"
       BACKUP_FILENAME_MODE: timestamp
+      BACKUP_ALLOW_UNVERSIONED_OVERWRITE: "${BACKUP_ALLOW_UNVERSIONED_OVERWRITE-false}"
       PASSPHRASE: "${PASSPHRASE:-}"
 ```
 
@@ -278,7 +279,7 @@ Unencrypted bundles use `.zip`; encrypted bundles use `.zip.gpg`. Database names
 Separate directories for each mode keep latest-backup lookup and deletion scoped to that mode.
 Use a separate `S3_PREFIX` for each source replica set.
 Generation names contain a UTC timestamp and a random 128-bit ID, independent of the scheduling timezone.
-The full S3 key is logged when an upload starts. Timestamp-mode uploads use `If-None-Match: *`
+The full S3 key is logged when an upload starts and when it succeeds. Timestamp-mode uploads use `If-None-Match: *`
 on both single-part writes and multipart completion to refuse replacement of an existing key.
 The S3 service must support these conditional writes; errors do not fall back to overwriting.
 This adds a compatibility requirement for S3-compatible services that did not implement conditional multipart completion.
@@ -292,11 +293,21 @@ selects the latest one. If that completion time is also tied, automatic restore 
 explicit generation; random IDs no longer break ties. An unreadable or invalid candidate also stops selection.
 Fixed-name objects and their version-ID selection retain the same naming format.
 
-`BACKUP_FILENAME_MODE=fixed` overwrites `full/latest.zip[.gpg]` or `per-database/<DB>/latest.zip[.gpg]`.
-Before uploading with a fixed filename, the tool checks bucket versioning and stops if it is disabled.
-If the check itself fails, for example because of insufficient permissions, the backup stops without uploading.
-This changes the previous warning-and-continue behavior; the backup account needs `s3:GetBucketVersioning`.
-Enable versioning beforehand.
+`BACKUP_FILENAME_MODE=fixed` checks `GetBucketVersioning` once before starting any dumps.
+It uses the same API for S3-compatible endpoints, including IDrive e2. The result applies to every database in that run.
+The fixed key is `full/latest.zip[.gpg]` or `per-database/<DB>/latest.zip[.gpg]` under the configured prefix.
+
+| Bucket versioning | `BACKUP_ALLOW_UNVERSIONED_OVERWRITE` unset or `false` | `true` |
+| --- | --- | --- |
+| `Enabled` | Write the fixed key | Write the fixed key |
+| `Suspended` or successful response with no `Status` | Warn and write a timestamped generation | Warn and overwrite the fixed key |
+| Check failed (e.g. `AccessDenied` or a network error) | Warn and write a timestamped generation | Warn and overwrite the fixed key |
+
+On upgrade, fixed-mode jobs that previously stopped at the versioning check can now publish a timestamped backup.
+Jobs upgrading from an older warning-and-overwrite release also switch to timestamped backups by default when versioning cannot be verified.
+To keep updating the fixed key, enable bucket versioning and grant the backup account `s3:GetBucketVersioning`,
+or explicitly accept the risk of losing the previous backup with `BACKUP_ALLOW_UNVERSIONED_OVERWRITE=true`.
+An upload error still fails the backup. `BACKUP_FILENAME_MODE=timestamp` skips the check and always writes a timestamped generation.
 
 After a successful backup, `BACKUP_KEEP_DAYS` deletes expired timestamped backups in the target directory.
 Expiration compares S3 last-modified times against the newly uploaded object's S3 timestamp, rather than the host clock.
@@ -341,6 +352,9 @@ extra log records. The actual database names and S3 keys are unchanged; log pars
 
 Create `restore.env` with the same `S3_PREFIX`, `BACKUP_MODE`, `BACKUP_FILENAME_MODE`, and `PASSPHRASE` used for the backup,
 and change the MongoDB URI to the **restore target**.
+If fixed mode used a timestamped filename, any existing `latest.zip[.gpg]` still refers to the earlier fixed backup.
+In your existing restore environment, set `BACKUP_FILENAME_MODE=timestamp` and run the command from the successful upload log.
+It selects the exact generation. Keep your usual restore image, network, and mounts. For a per-database restore, select that database in `restore.env`.
 The target should normally be an already provisioned, empty environment.
 A restore is not a transaction that rolls back on failure; partially written data remains if it fails.
 
@@ -444,11 +458,12 @@ Original ownership and permissions are not restored automatically; adjust them w
 | `SCHEDULE` | Empty | Cron expression, cron with seconds, `@daily`, etc. |
 | `BACKUP_KEEP_DAYS` | Empty | Delete expired backups after success; 1–36500 days |
 | `BACKUP_FILENAME_MODE` | `timestamp` | `timestamp` / `fixed` |
+| `BACKUP_ALLOW_UNVERSIONED_OVERWRITE` | `false` | In fixed mode, allow overwriting the fixed key when versioning is disabled or cannot be verified. Accepts exactly `true` or `false`. |
 | `PASSPHRASE` | Empty | Optional GPG symmetric encryption passphrase; newlines are not allowed |
 
 S3 permissions must allow uploading, listing, and downloading objects.
-Retention also requires deletion permissions, fixed filenames require checking bucket versioning,
-and restores by version ID require access to previous object versions.
+Retention also requires deletion permissions. Grant `s3:GetBucketVersioning` for the fixed-mode check.
+Restores by version ID require access to previous object versions.
 
 ## Development
 

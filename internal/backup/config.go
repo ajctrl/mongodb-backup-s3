@@ -33,6 +33,7 @@ type Config struct {
 	Databases, Exclude                                   []string
 	Prefix, Passphrase, KeepDays, FilenameMode, Schedule string
 	RestoreDrop                                          bool
+	AllowUnversionedOverwrite                            bool
 	ParallelCollections                                  int
 	Storage                                              storage.Config
 }
@@ -93,6 +94,12 @@ func loadConfig(lookup func(string) (string, bool)) (Config, error) {
 	}
 	if c.FilenameMode != "timestamp" && c.FilenameMode != "fixed" {
 		return c, fmt.Errorf("BACKUP_FILENAME_MODE must be timestamp or fixed")
+	}
+	if value, present := lookup("BACKUP_ALLOW_UNVERSIONED_OVERWRITE"); present {
+		if value != "true" && value != "false" {
+			return c, fmt.Errorf("BACKUP_ALLOW_UNVERSIONED_OVERWRITE must be true or false")
+		}
+		c.AllowUnversionedOverwrite = value == "true"
 	}
 	if strings.ContainsAny(c.Passphrase, "\r\n") {
 		return c, fmt.Errorf("PASSPHRASE must not contain newlines")
